@@ -3,17 +3,17 @@ package api
 import (
 	"encoding/json"
 	"matchmaking/internal/model"
-	"matchmaking/internal/worker"
+	"matchmaking/internal/queue"
 	"net/http"
 	"time"
 )
 
 type Handler struct {
-	mm *worker.MatchMaker
+	q *queue.Client
 }
 
-func NewHandler(mm *worker.MatchMaker) *Handler {
-	return &Handler{mm: mm}
+func NewHandler(q *queue.Client) *Handler {
+	return &Handler{q: q}
 }
 
 func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
@@ -36,7 +36,7 @@ func (h *Handler) join(w http.ResponseWriter, r *http.Request) {
 		Skill:      body.Skill,
 		EnqueuedAt: time.Now(),
 	}
-	if err := h.mm.Join(r.Context(), entry); err != nil {
+	if err := h.q.Join(r.Context(), entry); err != nil {
 		http.Error(w, "failed to join queue", http.StatusInternalServerError)
 		return
 	}
@@ -51,7 +51,7 @@ func (h *Handler) cancel(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid request body", http.StatusBadRequest)
 		return
 	}
-	if err := h.mm.Cancel(r.Context(), body.PlayerID); err != nil {
+	if err := h.q.Cancel(r.Context(), body.PlayerID); err != nil {
 		http.Error(w, "failed to cancel", http.StatusInternalServerError)
 		return
 	}
@@ -59,7 +59,7 @@ func (h *Handler) cancel(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) matchStatus(w http.ResponseWriter, r *http.Request) {
-	match, err := h.mm.GetMatch(r.Context(), r.PathValue("id"))
+	match, err := h.q.GetMatch(r.Context(), r.PathValue("id"))
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return

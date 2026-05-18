@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"math"
 	"matchmaking/internal/model"
+	"matchmaking/internal/rediskeys"
 	"os"
 	"time"
 
@@ -21,7 +22,6 @@ const (
 	matchTTL          = 10 * time.Minute
 )
 
-// lockRenewScript renews the shard lock TTL only if this worker still owns it.
 var lockRenewScript = redis.NewScript(`
 if redis.call("GET", KEYS[1]) == ARGV[1] then
     return redis.call("EXPIRE", KEYS[1], ARGV[2])
@@ -30,7 +30,6 @@ else
 end
 `)
 
-// lockReleaseScript deletes the shard lock only if this worker owns it.
 var lockReleaseScript = redis.NewScript(`
 if redis.call("GET", KEYS[1]) == ARGV[1] then
     return redis.call("DEL", KEYS[1])
@@ -39,13 +38,10 @@ else
 end
 `)
 
-// MatchMaker owns the in-memory pool for one shard and drives the tick loop.
-// Join, Cancel, and GetMatch are safe to call from the API process since they
-// only touch Redis; Run is called exclusively by the worker process.
+// MatchMaker owns the shard lock, the in-memory pool, and the tick loop.
+// It has no public queue API — use queue.Client for Join, Cancel, and GetMatch.
 type MatchMaker struct {
-	// pool is exclusively owned by the worker goroutine; no mutex needed.
-	pool map[string]*model.QueueEntry
-
+	pool        map[string]*model.QueueEntry
 	skillWindow float64
 	matchSize   int
 	shard       model.Shard
@@ -69,66 +65,6 @@ func newWorkerID() string {
 	return fmt.Sprintf("%s-%d", hostname, os.Getpid())
 }
 
-func (m *MatchMaker) queueKey() string {
-	return fmt.Sprintf("queue:%s:%s", m.shard.Region, m.shard.Mode)
-}
-
-func (m *MatchMaker) lockKey() string {
-	return fmt.Sprintf("shard_lock:%s:%s", m.shard.Region, m.shard.Mode)
-}
-
-func (m *MatchMaker) entryKey(playerID string) string {
-	return "queue_entry:" + playerID
-}
-
-func (m *MatchMaker) matchKey(matchID string) string {
-	return "match:" + matchID
-}
-
-// Join writes the queue entry to Redis. The worker picks it up on the next sync.
-func (m *MatchMaker) Join(ctx context.Context, entry *model.QueueEntry) error {
-	data, err := json.Marshal(entry)
-	if err != nil {
-		return err
-	}
-	pipe := m.rdb.Pipeline()
-	pipe.Set(ctx, m.entryKey(entry.PlayerID), data, 0)
-	pipe.ZAdd(ctx, m.queueKey(), redis.Z{
-		Score:  float64(entry.EnqueuedAt.UnixMilli()),
-		Member: entry.PlayerID,
-	})
-	_, err = pipe.Exec(ctx)
-	return err
-}
-
-// Cancel removes the player from Redis. The worker detects the removal on the next sync.
-func (m *MatchMaker) Cancel(ctx context.Context, playerID string) error {
-	pipe := m.rdb.Pipeline()
-	pipe.ZRem(ctx, m.queueKey(), playerID)
-	pipe.Del(ctx, m.entryKey(playerID))
-	_, err := pipe.Exec(ctx)
-	return err
-}
-
-// GetMatch reads a match record from Redis. Returns nil, nil if not found.
-func (m *MatchMaker) GetMatch(ctx context.Context, matchID string) (*model.Match, error) {
-	data, err := m.rdb.Get(ctx, m.matchKey(matchID)).Bytes()
-	if err == redis.Nil {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	var match model.Match
-	if err := json.Unmarshal(data, &match); err != nil {
-		return nil, err
-	}
-	return &match, nil
-}
-
-// Run acquires the shard lock, hydrates the pool from Redis, then runs the
-// lock renewer and tick loop under a shared errgroup context. If either
-// goroutine fails (e.g. lock lost), the other is cancelled and Run returns.
 func (m *MatchMaker) Run(ctx context.Context) error {
 	if err := m.acquireShardLock(ctx); err != nil {
 		return fmt.Errorf("acquire shard lock: %w", err)
@@ -147,7 +83,7 @@ func (m *MatchMaker) Run(ctx context.Context) error {
 
 func (m *MatchMaker) acquireShardLock(ctx context.Context) error {
 	for {
-		ok, err := m.rdb.SetNX(ctx, m.lockKey(), m.workerID, lockTTL).Result()
+		ok, err := m.rdb.SetNX(ctx, rediskeys.ShardLock(m.shard), m.workerID, lockTTL).Result()
 		if err != nil {
 			return err
 		}
@@ -171,14 +107,14 @@ func (m *MatchMaker) renewLockLoop(ctx context.Context) error {
 		select {
 		case <-ticker.C:
 			res, err := lockRenewScript.Run(
-				ctx, m.rdb, []string{m.lockKey()},
+				ctx, m.rdb, []string{rediskeys.ShardLock(m.shard)},
 				m.workerID, int(lockTTL.Seconds()),
 			).Int()
 			if err != nil {
 				return fmt.Errorf("lock renew: %w", err)
 			}
 			if res == 0 {
-				return fmt.Errorf("shard lock lost: %s", m.lockKey())
+				return fmt.Errorf("shard lock lost: %s", rediskeys.ShardLock(m.shard))
 			}
 		case <-ctx.Done():
 			return nil
@@ -189,16 +125,14 @@ func (m *MatchMaker) renewLockLoop(ctx context.Context) error {
 func (m *MatchMaker) releaseShardLock() {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	if err := lockReleaseScript.Run(ctx, m.rdb, []string{m.lockKey()}, m.workerID).Err(); err != nil {
+	if err := lockReleaseScript.Run(ctx, m.rdb, []string{rediskeys.ShardLock(m.shard)}, m.workerID).Err(); err != nil {
 		slog.Error("failed to release shard lock", "err", err)
 	}
 	slog.Info("released shard lock", "shard", m.shard)
 }
 
-// syncPool brings the in-memory pool in line with the Redis sorted set:
-// new entries are fetched and added; entries absent from Redis are removed.
 func (m *MatchMaker) syncPool(ctx context.Context) error {
-	ids, err := m.rdb.ZRange(ctx, m.queueKey(), 0, -1).Result()
+	ids, err := m.rdb.ZRange(ctx, rediskeys.Queue(m.shard), 0, -1).Result()
 	if err != nil {
 		return err
 	}
@@ -227,7 +161,7 @@ func (m *MatchMaker) syncPool(ctx context.Context) error {
 	pipe := m.rdb.Pipeline()
 	cmds := make([]*redis.StringCmd, len(newIDs))
 	for i, id := range newIDs {
-		cmds[i] = pipe.Get(ctx, m.entryKey(id))
+		cmds[i] = pipe.Get(ctx, rediskeys.QueueEntry(id))
 	}
 	if _, err := pipe.Exec(ctx); err != nil && err != redis.Nil {
 		return err
@@ -236,7 +170,7 @@ func (m *MatchMaker) syncPool(ctx context.Context) error {
 	for i, cmd := range cmds {
 		data, err := cmd.Bytes()
 		if err != nil {
-			continue // entry cancelled between ZRANGE and pipeline fetch
+			continue
 		}
 		var entry model.QueueEntry
 		if err := json.Unmarshal(data, &entry); err != nil {
@@ -317,13 +251,12 @@ func (m *MatchMaker) formMatch(ctx context.Context, group []*model.QueueEntry, u
 		return err
 	}
 
-	// Remove players from queue and write match record atomically in one pipeline.
 	pipe := m.rdb.Pipeline()
 	for _, e := range group {
-		pipe.ZRem(ctx, m.queueKey(), e.PlayerID)
-		pipe.Del(ctx, m.entryKey(e.PlayerID))
+		pipe.ZRem(ctx, rediskeys.Queue(m.shard), e.PlayerID)
+		pipe.Del(ctx, rediskeys.QueueEntry(e.PlayerID))
 	}
-	pipe.Set(ctx, m.matchKey(match.ID), matchData, matchTTL)
+	pipe.Set(ctx, rediskeys.Match(match.ID), matchData, matchTTL)
 	if _, err := pipe.Exec(ctx); err != nil {
 		return err
 	}

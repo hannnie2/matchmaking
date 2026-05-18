@@ -6,7 +6,7 @@ import (
 	"log/slog"
 	"matchmaking/internal/api"
 	"matchmaking/internal/model"
-	"matchmaking/internal/worker"
+	"matchmaking/internal/queue"
 	"net/http"
 	"os"
 	"os/signal"
@@ -20,21 +20,19 @@ func main() {
 		Addr: envOr("REDIS_ADDR", "localhost:6379"),
 	})
 
-	mm := worker.New(
+	q := queue.New(
 		model.Shard{
 			Region: envOr("SHARD_REGION", "NA-E"),
 			Mode:   envOr("SHARD_MODE", "ranked"),
 		},
 		rdb,
-		100, // skillWindow
-		2,   // matchSize
 	)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 
 	mux := http.NewServeMux()
-	api.NewHandler(mm).RegisterRoutes(mux)
+	api.NewHandler(q).RegisterRoutes(mux)
 	server := &http.Server{Addr: ":8080", Handler: mux}
 
 	go func() {
