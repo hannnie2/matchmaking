@@ -1,0 +1,39 @@
+# Binaries
+bin/
+matchmaking-api
+matchmaking-worker
+matchmaking-hub
+matchmaking-rating
+matchmaking-reconciler
+
+# Build output
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test cache and coverage
+*.test
+*.out
+coverage.html
+
+# Environment
+.env
+.env.*
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Helm
+helm/charts/
+helm/*.lock
+
+.claude
+CLAUDE.md
