@@ -22,11 +22,13 @@ func TestJoinWritesToRedis(t *testing.T) {
 	c, rdb := newTestClient(t)
 	ctx := context.Background()
 
-	if err := c.Join(ctx, &model.QueueEntry{PlayerID: "p1", Skill: 1000, EnqueuedAt: time.Now()}); err != nil {
+	if err := c.Join(ctx, &model.QueueEntry{PlayerID: "p1", Skill: 1050, EnqueuedAt: time.Now()}); err != nil {
 		t.Fatalf("Join: %v", err)
 	}
 
-	n, err := rdb.ZCard(ctx, rediskeys.Queue(c.shard)).Result()
+	// Skill 1050 → band "1000-1200"
+	shard := model.Shard{Region: "test", Mode: "casual", SkillBand: "1000-1200"}
+	n, err := rdb.ZCard(ctx, rediskeys.Queue(shard)).Result()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -43,20 +45,24 @@ func TestJoinWritesToRedis(t *testing.T) {
 	}
 }
 
-func TestCancelRemovesFromRedis(t *testing.T) {
+func TestCancelDeletesEntry(t *testing.T) {
 	c, rdb := newTestClient(t)
 	ctx := context.Background()
 
-	c.Join(ctx, &model.QueueEntry{PlayerID: "p1", Skill: 1000, EnqueuedAt: time.Now()})
+	c.Join(ctx, &model.QueueEntry{PlayerID: "p1", Skill: 1050, EnqueuedAt: time.Now()})
 	c.Cancel(ctx, "p1")
 
-	n, _ := rdb.ZCard(ctx, rediskeys.Queue(c.shard)).Result()
-	if n != 0 {
-		t.Fatalf("expected empty sorted set after cancel, got %d", n)
-	}
+	// queue_entry must be deleted so the worker skips the player on next pop
 	exists, _ := rdb.Exists(ctx, rediskeys.QueueEntry("p1")).Result()
 	if exists != 0 {
-		t.Fatal("expected entry key to be deleted")
+		t.Fatal("expected entry key to be deleted after cancel")
+	}
+
+	// player must appear in the cancelled set
+	shard := model.Shard{Region: "test", Mode: "casual"}
+	isMember, _ := rdb.SIsMember(ctx, rediskeys.Cancelled(shard), "p1").Result()
+	if !isMember {
+		t.Fatal("expected p1 in cancelled set")
 	}
 }
 
@@ -68,5 +74,52 @@ func TestGetMatchNotFound(t *testing.T) {
 	}
 	if match != nil {
 		t.Fatal("expected nil for missing match")
+	}
+}
+
+// TestJoinRejectedAfterCancel covers the Cancel-before-Join race: a player who
+// calls Cancel must not be re-admitted to the queue by a concurrent Join.
+func TestJoinRejectedAfterCancel(t *testing.T) {
+	c, rdb := newTestClient(t)
+	ctx := context.Background()
+
+	if err := c.Cancel(ctx, "p1"); err != nil {
+		t.Fatalf("Cancel: %v", err)
+	}
+
+	err := c.Join(ctx, &model.QueueEntry{PlayerID: "p1", Skill: 1050, EnqueuedAt: time.Now()})
+	if err != ErrPlayerCancelled {
+		t.Fatalf("expected ErrPlayerCancelled, got %v", err)
+	}
+
+	shard := model.Shard{Region: "test", Mode: "casual", SkillBand: "1000-1200"}
+	n, _ := rdb.ZCard(ctx, rediskeys.Queue(shard)).Result()
+	if n != 0 {
+		t.Fatalf("expected empty sorted set, got %d", n)
+	}
+	exists, _ := rdb.Exists(ctx, rediskeys.QueueEntry("p1")).Result()
+	if exists != 0 {
+		t.Fatal("expected no queue entry key")
+	}
+}
+
+func TestComputeSkillBand(t *testing.T) {
+	cases := []struct {
+		skill float64
+		want  string
+	}{
+		{999, "1000-1200"},
+		{1000, "1000-1200"},
+		{1199, "1000-1200"},
+		{1200, "1200-1400"},
+		{1500, "1400-1600"},
+		{2399, "2200-2400"},
+		{2400, "2200-2400"},
+		{9999, "2200-2400"},
+	}
+	for _, tc := range cases {
+		if got := computeSkillBand(tc.skill); got != tc.want {
+			t.Errorf("computeSkillBand(%.0f) = %q, want %q", tc.skill, got, tc.want)
+		}
 	}
 }

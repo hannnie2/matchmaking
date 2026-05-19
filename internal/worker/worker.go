@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"math"
 	"matchmaking/internal/model"
 	"matchmaking/internal/rediskeys"
 	"os"
@@ -18,8 +17,9 @@ import (
 const (
 	lockTTL           = 5 * time.Second
 	lockRenewInterval = 2 * time.Second
-	tickInterval      = 500 * time.Millisecond
 	matchTTL          = 10 * time.Minute
+	popBatchSize      = 16
+	emptyQueueDelay   = 100 * time.Millisecond
 )
 
 var lockRenewScript = redis.NewScript(`
@@ -38,25 +38,43 @@ else
 end
 `)
 
-// MatchMaker owns the shard lock, the in-memory pool, and the tick loop.
-// It has no public queue API — use queue.Client for Join, Cancel, and GetMatch.
+// commitMatchScript atomically checks that none of the players appear in the
+// cancelled set before writing the match record and deleting queue entries.
+//
+// KEYS[1]        = cancelled:{region}:{mode}
+// KEYS[2]        = match:{matchID}
+// KEYS[3..N+2]   = queue_entry:{playerID} for each of N players
+// ARGV[1..N]     = playerIDs
+// ARGV[N+1]      = match JSON
+// ARGV[N+2]      = TTL seconds
+var commitMatchScript = redis.NewScript(`
+local n = #ARGV - 2
+for i = 1, n do
+    if redis.call("SISMEMBER", KEYS[1], ARGV[i]) == 1 then
+        return 0
+    end
+end
+redis.call("SET", KEYS[2], ARGV[n + 1], "EX", tonumber(ARGV[n + 2]))
+for i = 1, n do
+    redis.call("DEL", KEYS[i + 2])
+end
+return 1
+`)
+
 type MatchMaker struct {
-	pool        map[string]*model.QueueEntry
-	skillWindow float64
-	matchSize   int
-	shard       model.Shard
-	rdb         *redis.Client
-	workerID    string
+	matchSize int
+	shard     model.Shard
+	rdb       *redis.Client
+	workerID  string
+	matchSeq  int64
 }
 
-func New(shard model.Shard, rdb *redis.Client, skillWindow float64, matchSize int) *MatchMaker {
+func New(shard model.Shard, rdb *redis.Client, matchSize int) *MatchMaker {
 	return &MatchMaker{
-		pool:        make(map[string]*model.QueueEntry),
-		skillWindow: skillWindow,
-		matchSize:   matchSize,
-		shard:       shard,
-		rdb:         rdb,
-		workerID:    newWorkerID(),
+		matchSize: matchSize,
+		shard:     shard,
+		rdb:       rdb,
+		workerID:  newWorkerID(),
 	}
 }
 
@@ -71,13 +89,9 @@ func (m *MatchMaker) Run(ctx context.Context) error {
 	}
 	defer m.releaseShardLock()
 
-	if err := m.syncPool(ctx); err != nil {
-		return fmt.Errorf("initial pool sync: %w", err)
-	}
-
 	g, ctx := errgroup.WithContext(ctx)
 	g.Go(func() error { return m.renewLockLoop(ctx) })
-	g.Go(func() error { return m.tickLoop(ctx) })
+	g.Go(func() error { return m.popLoop(ctx) })
 	return g.Wait()
 }
 
@@ -103,18 +117,19 @@ func (m *MatchMaker) acquireShardLock(ctx context.Context) error {
 func (m *MatchMaker) renewLockLoop(ctx context.Context) error {
 	ticker := time.NewTicker(lockRenewInterval)
 	defer ticker.Stop()
+	lockKey := rediskeys.ShardLock(m.shard)
 	for {
 		select {
 		case <-ticker.C:
 			res, err := lockRenewScript.Run(
-				ctx, m.rdb, []string{rediskeys.ShardLock(m.shard)},
+				ctx, m.rdb, []string{lockKey},
 				m.workerID, int(lockTTL.Seconds()),
 			).Int()
 			if err != nil {
 				return fmt.Errorf("lock renew: %w", err)
 			}
 			if res == 0 {
-				return fmt.Errorf("shard lock lost: %s", rediskeys.ShardLock(m.shard))
+				return fmt.Errorf("shard lock lost: %s", lockKey)
 			}
 		case <-ctx.Done():
 			return nil
@@ -125,147 +140,153 @@ func (m *MatchMaker) renewLockLoop(ctx context.Context) error {
 func (m *MatchMaker) releaseShardLock() {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	if err := lockReleaseScript.Run(ctx, m.rdb, []string{rediskeys.ShardLock(m.shard)}, m.workerID).Err(); err != nil {
+	lockKey := rediskeys.ShardLock(m.shard)
+	if err := lockReleaseScript.Run(ctx, m.rdb, []string{lockKey}, m.workerID).Err(); err != nil {
 		slog.Error("failed to release shard lock", "err", err)
 	}
 	slog.Info("released shard lock", "shard", m.shard)
 }
 
-func (m *MatchMaker) syncPool(ctx context.Context) error {
-	ids, err := m.rdb.ZRange(ctx, rediskeys.Queue(m.shard), 0, -1).Result()
+// bufferedEntry holds a popped player together with their original enqueue
+// score so they can be re-pushed with FIFO ordering preserved on conflict.
+type bufferedEntry struct {
+	entry *model.QueueEntry
+	score float64
+}
+
+func (m *MatchMaker) popLoop(ctx context.Context) error {
+	var buffer []bufferedEntry
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		default:
+		}
+		var err error
+		buffer, err = m.popOnce(ctx, buffer)
+		if err != nil {
+			return err
+		}
+	}
+}
+
+// popOnce pops up to popBatchSize players from the sorted set, appends valid
+// entries to buffer, and commits a match whenever the buffer reaches matchSize.
+// It returns the updated buffer.
+func (m *MatchMaker) popOnce(ctx context.Context, buffer []bufferedEntry) ([]bufferedEntry, error) {
+	zs, err := m.rdb.ZPopMin(ctx, rediskeys.Queue(m.shard), popBatchSize).Result()
 	if err != nil {
-		return err
+		return buffer, fmt.Errorf("zpopmin: %w", err)
 	}
 
-	inRedis := make(map[string]bool, len(ids))
-	for _, id := range ids {
-		inRedis[id] = true
-	}
-
-	for playerID := range m.pool {
-		if !inRedis[playerID] {
-			delete(m.pool, playerID)
+	if len(zs) == 0 {
+		select {
+		case <-ctx.Done():
+		case <-time.After(emptyQueueDelay):
 		}
-	}
-
-	var newIDs []string
-	for _, id := range ids {
-		if _, exists := m.pool[id]; !exists {
-			newIDs = append(newIDs, id)
-		}
-	}
-	if len(newIDs) == 0 {
-		return nil
+		return buffer, nil
 	}
 
 	pipe := m.rdb.Pipeline()
-	cmds := make([]*redis.StringCmd, len(newIDs))
-	for i, id := range newIDs {
-		cmds[i] = pipe.Get(ctx, rediskeys.QueueEntry(id))
+	cmds := make([]*redis.StringCmd, len(zs))
+	for i, z := range zs {
+		cmds[i] = pipe.Get(ctx, rediskeys.QueueEntry(z.Member.(string)))
 	}
 	if _, err := pipe.Exec(ctx); err != nil && err != redis.Nil {
-		return err
+		return buffer, fmt.Errorf("fetch entries: %w", err)
 	}
 
 	for i, cmd := range cmds {
 		data, err := cmd.Bytes()
 		if err != nil {
+			// nil result means Cancel deleted the entry; discard this player
+			slog.Debug("skipping cancelled player", "player_id", zs[i].Member)
 			continue
 		}
 		var entry model.QueueEntry
 		if err := json.Unmarshal(data, &entry); err != nil {
-			slog.Error("malformed queue entry", "player_id", newIDs[i], "err", err)
+			slog.Error("malformed queue entry", "player_id", zs[i].Member, "err", err)
 			continue
 		}
-		m.pool[entry.PlayerID] = &entry
+		buffer = append(buffer, bufferedEntry{entry: &entry, score: zs[i].Score})
 	}
-	return nil
+
+	for len(buffer) >= m.matchSize {
+		group := buffer[:m.matchSize]
+		buffer = buffer[m.matchSize:]
+
+		ok, err := m.commitMatch(ctx, group)
+		if err != nil {
+			return buffer, fmt.Errorf("commit match: %w", err)
+		}
+		if !ok {
+			// A player was cancelled between pop and commit. Re-push the whole
+			// group; the cancelled player's queue_entry is already deleted so
+			// they will be skipped on the next pop.
+			if err := m.repushGroup(ctx, group); err != nil {
+				slog.Error("failed to re-push group after conflict", "err", err)
+			}
+		}
+	}
+
+	return buffer, nil
 }
 
-func (m *MatchMaker) tickLoop(ctx context.Context) error {
-	ticker := time.NewTicker(tickInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ticker.C:
-			if err := m.syncPool(ctx); err != nil {
-				slog.Error("pool sync failed", "err", err)
-			}
-			if err := m.tick(ctx); err != nil {
-				slog.Error("tick failed", "err", err)
-			}
-		case <-ctx.Done():
-			return nil
-		}
-	}
-}
-
-func (m *MatchMaker) tick(ctx context.Context) error {
-	entries := make([]*model.QueueEntry, 0, len(m.pool))
-	for _, e := range m.pool {
-		entries = append(entries, e)
-	}
-
-	used := make(map[string]bool)
-	for i, anchor := range entries {
-		if used[anchor.PlayerID] {
-			continue
-		}
-		group := []*model.QueueEntry{anchor}
-		for _, candidate := range entries[i+1:] {
-			if used[candidate.PlayerID] {
-				continue
-			}
-			if math.Abs(anchor.Skill-candidate.Skill) <= m.skillWindow {
-				group = append(group, candidate)
-			}
-			if len(group) == m.matchSize {
-				break
-			}
-		}
-		if len(group) < m.matchSize {
-			continue
-		}
-		if err := m.formMatch(ctx, group, used); err != nil {
-			slog.Error("failed to form match", "err", err)
-		}
-	}
-	return nil
-}
-
-func (m *MatchMaker) formMatch(ctx context.Context, group []*model.QueueEntry, used map[string]bool) error {
-	ids := make([]string, len(group))
-	for i, e := range group {
-		ids[i] = e.PlayerID
+// commitMatch atomically verifies no player has been cancelled, writes the
+// match record, and deletes queue entries. Returns false if a cancellation is
+// detected — the caller is responsible for re-pushing the group.
+func (m *MatchMaker) commitMatch(ctx context.Context, group []bufferedEntry) (bool, error) {
+	m.matchSeq++
+	playerIDs := make([]string, len(group))
+	for i, be := range group {
+		playerIDs[i] = be.entry.PlayerID
 	}
 
 	match := &model.Match{
-		ID:        fmt.Sprintf("match-%d", time.Now().UnixNano()),
-		PlayerIDs: ids,
+		ID:        fmt.Sprintf("match-%d-%d", time.Now().UnixMilli(), m.matchSeq),
+		PlayerIDs: playerIDs,
 		Status:    model.MatchStatusForming,
 		FormedAt:  time.Now(),
 	}
-
 	matchData, err := json.Marshal(match)
 	if err != nil {
-		return err
+		return false, err
 	}
 
+	// KEYS: cancelled set, match key, then one queue_entry key per player
+	keys := make([]string, 0, 2+len(playerIDs))
+	keys = append(keys, rediskeys.Cancelled(m.shard), rediskeys.Match(match.ID))
+	for _, id := range playerIDs {
+		keys = append(keys, rediskeys.QueueEntry(id))
+	}
+
+	// ARGV: playerIDs..., match JSON, TTL
+	args := make([]interface{}, 0, len(playerIDs)+2)
+	for _, id := range playerIDs {
+		args = append(args, id)
+	}
+	args = append(args, string(matchData), int(matchTTL.Seconds()))
+
+	result, err := commitMatchScript.Run(ctx, m.rdb, keys, args...).Int()
+	if err != nil {
+		return false, err
+	}
+	if result == 0 {
+		return false, nil
+	}
+
+	slog.Info("match formed", "match_id", match.ID, "players", playerIDs)
+	return true, nil
+}
+
+func (m *MatchMaker) repushGroup(ctx context.Context, group []bufferedEntry) error {
 	pipe := m.rdb.Pipeline()
-	for _, e := range group {
-		pipe.ZRem(ctx, rediskeys.Queue(m.shard), e.PlayerID)
-		pipe.Del(ctx, rediskeys.QueueEntry(e.PlayerID))
+	for _, be := range group {
+		pipe.ZAdd(ctx, rediskeys.Queue(m.shard), redis.Z{
+			Score:  be.score,
+			Member: be.entry.PlayerID,
+		})
 	}
-	pipe.Set(ctx, rediskeys.Match(match.ID), matchData, matchTTL)
-	if _, err := pipe.Exec(ctx); err != nil {
-		return err
-	}
-
-	for _, e := range group {
-		used[e.PlayerID] = true
-		delete(m.pool, e.PlayerID)
-	}
-
-	slog.Info("match formed", "match_id", match.ID, "players", ids)
-	return nil
+	_, err := pipe.Exec(ctx)
+	return err
 }

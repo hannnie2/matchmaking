@@ -19,12 +19,12 @@ func main() {
 
 	mm := worker.New(
 		model.Shard{
-			Region: envOr("SHARD_REGION", "NA-E"),
-			Mode:   envOr("SHARD_MODE", "ranked"),
+			Region:    envOr("SHARD_REGION", "NA-E"),
+			Mode:      envOr("SHARD_MODE", "ranked"),
+			SkillBand: envOr("SHARD_SKILLBAND", "1000-1200"),
 		},
 		rdb,
-		100, // skillWindow
-		2,   // matchSize
+		24,
 	)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)

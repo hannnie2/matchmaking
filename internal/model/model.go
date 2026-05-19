@@ -6,11 +6,15 @@ import (
 )
 
 type Shard struct {
-	Region string
-	Mode   string
+	Region    string
+	Mode      string
+	SkillBand string // e.g. "1000-1200"; empty for client-side usage
 }
 
 func (s Shard) String() string {
+	if s.SkillBand != "" {
+		return fmt.Sprintf("%s/%s/%s", s.Region, s.Mode, s.SkillBand)
+	}
 	return fmt.Sprintf("%s/%s", s.Region, s.Mode)
 }
 
