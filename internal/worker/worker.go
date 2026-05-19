@@ -40,14 +40,13 @@ end
 `)
 
 // commitMatchScript atomically checks that none of the players appear in the
-// cancelled set before writing the match record and deleting queue entries.
+// cancelled set before writing the match record.
 //
-// KEYS[1]        = cancelled:{region}:{mode}
-// KEYS[2]        = match:{matchID}
-// KEYS[3..N+2]   = queue_entry:{playerID} for each of N players
-// ARGV[1..N]     = playerIDs
-// ARGV[N+1]      = match JSON
-// ARGV[N+2]      = TTL seconds
+// KEYS[1]    = cancelled:{region}:{mode}
+// KEYS[2]    = match:{matchID}
+// ARGV[1..N] = playerIDs
+// ARGV[N+1]  = match JSON
+// ARGV[N+2]  = TTL seconds
 var commitMatchScript = redis.NewScript(`
 local n = #ARGV - 2
 for i = 1, n do
@@ -56,9 +55,6 @@ for i = 1, n do
     end
 end
 redis.call("SET", KEYS[2], ARGV[n + 1], "EX", tonumber(ARGV[n + 2]))
-for i = 1, n do
-    redis.call("DEL", KEYS[i + 2])
-end
 return 1
 `)
 
@@ -152,11 +148,12 @@ func (m *MatchMaker) releaseShardLock() {
 	slog.Info("released shard lock", "shard", m.shard)
 }
 
-// bufferedEntry holds a popped player together with their original enqueue
-// score so they can be re-pushed with FIFO ordering preserved on conflict.
+// bufferedEntry holds a popped player, the raw JSON member (for re-push), and
+// the original score (to preserve FIFO ordering on conflict).
 type bufferedEntry struct {
-	entry *model.QueueEntry
-	score float64
+	entry  *model.QueueEntry
+	member string // raw JSON as it appeared in the sorted set
+	score  float64
 }
 
 func (m *MatchMaker) popLoop(ctx context.Context) error {
@@ -175,9 +172,9 @@ func (m *MatchMaker) popLoop(ctx context.Context) error {
 	}
 }
 
-// popOnce pops up to popBatchSize players from the sorted set, appends valid
-// entries to buffer, and commits a match whenever the buffer reaches matchSize.
-// It returns the updated buffer.
+// popOnce pops up to popBatchSize players from the sorted set, parses their
+// JSON members directly, filters cancelled players via SMIsMember, and commits
+// a match whenever the buffer reaches matchSize. Returns the updated buffer.
 func (m *MatchMaker) popOnce(ctx context.Context, buffer []bufferedEntry) ([]bufferedEntry, error) {
 	zs, err := m.rdb.ZPopMin(ctx, rediskeys.Queue(m.shard), popBatchSize).Result()
 	if err != nil {
@@ -192,28 +189,45 @@ func (m *MatchMaker) popOnce(ctx context.Context, buffer []bufferedEntry) ([]buf
 		return buffer, nil
 	}
 
-	pipe := m.rdb.Pipeline()
-	cmds := make([]*redis.StringCmd, len(zs))
-	for i, z := range zs {
-		cmds[i] = pipe.Get(ctx, rediskeys.QueueEntry(z.Member.(string)))
+	// Parse JSON members directly — no separate GET round-trip needed.
+	type candidate struct {
+		entry  *model.QueueEntry
+		member string
+		score  float64
 	}
-	if _, err := pipe.Exec(ctx); err != nil && err != redis.Nil {
-		return buffer, fmt.Errorf("fetch entries: %w", err)
+	candidates := make([]candidate, 0, len(zs))
+	for _, z := range zs {
+		member := z.Member.(string)
+		var entry model.QueueEntry
+		if err := json.Unmarshal([]byte(member), &entry); err != nil {
+			slog.Error("malformed queue member", "err", err)
+			continue
+		}
+		candidates = append(candidates, candidate{&entry, member, z.Score})
 	}
 
-	for i, cmd := range cmds {
-		data, err := cmd.Bytes()
-		if err != nil {
-			// nil result means Cancel deleted the entry; discard this player
-			slog.Debug("skipping cancelled player", "player_id", zs[i].Member)
+	if len(candidates) == 0 {
+		return buffer, nil
+	}
+
+	// Batch-check the cancelled set in one round-trip.
+	memberArgs := make([]interface{}, len(candidates))
+	for i, c := range candidates {
+		memberArgs[i] = c.entry.PlayerID
+	}
+	cancelled, err := m.rdb.SMIsMember(ctx, rediskeys.Cancelled(m.shard), memberArgs...).Result()
+	if err != nil {
+		// On error be conservative: skip the cancelled check and let
+		// commitMatchScript catch any cancelled players at commit time.
+		cancelled = make([]bool, len(candidates))
+	}
+
+	for i, c := range candidates {
+		if cancelled[i] {
+			slog.Debug("skipping cancelled player", "player_id", c.entry.PlayerID)
 			continue
 		}
-		var entry model.QueueEntry
-		if err := json.Unmarshal(data, &entry); err != nil {
-			slog.Error("malformed queue entry", "player_id", zs[i].Member, "err", err)
-			continue
-		}
-		buffer = append(buffer, bufferedEntry{entry: &entry, score: zs[i].Score})
+		buffer = append(buffer, bufferedEntry{entry: c.entry, member: c.member, score: c.score})
 	}
 
 	for len(buffer) >= m.matchSize {
@@ -258,12 +272,7 @@ func (m *MatchMaker) commitMatch(ctx context.Context, group []bufferedEntry) (bo
 		return false, err
 	}
 
-	// KEYS: cancelled set, match key, then one queue_entry key per player
-	keys := make([]string, 0, 2+len(playerIDs))
-	keys = append(keys, rediskeys.Cancelled(m.shard), rediskeys.Match(match.ID))
-	for _, id := range playerIDs {
-		keys = append(keys, rediskeys.QueueEntry(id))
-	}
+	keys := []string{rediskeys.Cancelled(m.shard), rediskeys.Match(match.ID)}
 
 	// ARGV: playerIDs..., match JSON, TTL
 	args := make([]interface{}, 0, len(playerIDs)+2)
@@ -289,7 +298,7 @@ func (m *MatchMaker) repushGroup(ctx context.Context, group []bufferedEntry) err
 	for _, be := range group {
 		pipe.ZAdd(ctx, rediskeys.Queue(m.shard), redis.Z{
 			Score:  be.score,
-			Member: be.entry.PlayerID,
+			Member: be.member, // re-push the original JSON member
 		})
 	}
 	_, err := pipe.Exec(ctx)

@@ -24,36 +24,32 @@ const (
 // cancellation in Redis. The join is rejected to prevent a ghost match.
 var ErrPlayerCancelled = errors.New("player has a pending cancellation")
 
-// joinScript atomically checks the cancelled set before writing the entry and
-// adding the player to the skill-band sorted set.
+// joinScript atomically checks the cancelled set then ZADDs the serialised
+// QueueEntry JSON as the sorted set member. No separate queue_entry key.
 //
 // KEYS[1] = q:{region}:{mode}:{skillband}
-// KEYS[2] = queue_entry:{playerID}
-// KEYS[3] = cancelled:{region}:{mode}
+// KEYS[2] = cancelled:{region}:{mode}
 // ARGV[1] = enqueue score (UnixMilli as string)
-// ARGV[2] = playerID
-// ARGV[3] = serialised QueueEntry JSON
+// ARGV[2] = playerID (for cancelled check only)
+// ARGV[3] = serialised QueueEntry JSON (used as member)
 var joinScript = redis.NewScript(`
-if redis.call("SISMEMBER", KEYS[3], ARGV[2]) == 1 then
+if redis.call("SISMEMBER", KEYS[2], ARGV[2]) == 1 then
     return 0
 end
-redis.call("SET", KEYS[2], ARGV[3])
-redis.call("ZADD", KEYS[1], ARGV[1], ARGV[2])
+redis.call("ZADD", KEYS[1], ARGV[1], ARGV[3])
 return 1
 `)
 
-// cancelScript atomically deletes the queue entry, records the cancellation,
-// and refreshes the TTL on the cancelled set — closing the race window between
-// the DEL and the SADD that a non-atomic pipeline would leave open.
+// cancelScript atomically records the cancellation and refreshes the TTL.
+// There is no queue_entry key to delete; the worker filters cancelled players
+// via SMIsMember after each ZPOPMIN.
 //
-// KEYS[1] = queue_entry:{playerID}
-// KEYS[2] = cancelled:{region}:{mode}
+// KEYS[1] = cancelled:{region}:{mode}
 // ARGV[1] = playerID
-// ARGV[2] = cancelled set TTL in seconds
+// ARGV[2] = TTL in seconds
 var cancelScript = redis.NewScript(`
-redis.call("DEL", KEYS[1])
-redis.call("SADD", KEYS[2], ARGV[1])
-redis.call("EXPIRE", KEYS[2], ARGV[2])
+redis.call("SADD", KEYS[1], ARGV[1])
+redis.call("EXPIRE", KEYS[1], ARGV[2])
 return 1
 `)
 
@@ -76,12 +72,8 @@ func (c *Client) Join(ctx context.Context, entry *model.QueueEntry) error {
 		Mode:      c.shard.Mode,
 		SkillBand: computeSkillBand(entry.Skill),
 	}
-	keys := []string{
-		rediskeys.Queue(shard),
-		rediskeys.QueueEntry(entry.PlayerID),
-		rediskeys.Cancelled(shard),
-	}
-	result, err := joinScript.Run(ctx, c.rdb, keys,
+	result, err := joinScript.Run(ctx, c.rdb,
+		[]string{rediskeys.Queue(shard), rediskeys.Cancelled(shard)},
 		fmt.Sprintf("%d", entry.EnqueuedAt.UnixMilli()),
 		entry.PlayerID,
 		string(data),
@@ -95,13 +87,12 @@ func (c *Client) Join(ctx context.Context, entry *model.QueueEntry) error {
 	return nil
 }
 
-// Cancel atomically removes the player's queue entry and records the
-// cancellation. It does not remove the player from the sorted set because the
-// skill band is not known at cancel time; the worker detects the missing entry
-// on next pop.
+// Cancel records the cancellation atomically. The player's JSON member remains
+// in the sorted set until the worker pops it; the cancelled set causes the
+// worker to discard them before buffering.
 func (c *Client) Cancel(ctx context.Context, playerID string) error {
 	return cancelScript.Run(ctx, c.rdb,
-		[]string{rediskeys.QueueEntry(playerID), rediskeys.Cancelled(c.shard)},
+		[]string{rediskeys.Cancelled(c.shard)},
 		playerID, int(cancelledSetTTL.Seconds()),
 	).Err()
 }

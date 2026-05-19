@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"matchmaking/internal/model"
 	"matchmaking/internal/queue"
@@ -133,10 +134,10 @@ func TestCommitMatchRejectsCancelledPlayer(t *testing.T) {
 	// Fetch remaining 8 without triggering a commit by injecting them directly.
 	zs, _ := rdb.ZPopMin(ctx, "q:test:casual:1000-1200", 8).Result()
 	for _, z := range zs {
-		buf = append(buf, bufferedEntry{
-			entry: &model.QueueEntry{PlayerID: z.Member.(string), Skill: 1050, EnqueuedAt: time.Now()},
-			score: z.Score,
-		})
+		member := z.Member.(string)
+		var entry model.QueueEntry
+		json.Unmarshal([]byte(member), &entry)
+		buf = append(buf, bufferedEntry{entry: &entry, member: member, score: z.Score})
 	}
 
 	// Cancel one player after they are already in the buffer (post-pop race).

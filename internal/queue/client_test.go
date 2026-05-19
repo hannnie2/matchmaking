@@ -26,7 +26,7 @@ func TestJoinWritesToRedis(t *testing.T) {
 		t.Fatalf("Join: %v", err)
 	}
 
-	// Skill 1050 → band "1000-1200"
+	// Skill 1050 → band "1000-1200"; JSON is stored as the sorted set member.
 	shard := model.Shard{Region: "test", Mode: "casual", SkillBand: "1000-1200"}
 	n, err := rdb.ZCard(ctx, rediskeys.Queue(shard)).Result()
 	if err != nil {
@@ -35,30 +35,15 @@ func TestJoinWritesToRedis(t *testing.T) {
 	if n != 1 {
 		t.Fatalf("expected 1 member in sorted set, got %d", n)
 	}
-
-	exists, err := rdb.Exists(ctx, rediskeys.QueueEntry("p1")).Result()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if exists == 0 {
-		t.Fatal("expected entry key to exist")
-	}
 }
 
-func TestCancelDeletesEntry(t *testing.T) {
+func TestCancelAddsToSet(t *testing.T) {
 	c, rdb := newTestClient(t)
 	ctx := context.Background()
 
 	c.Join(ctx, &model.QueueEntry{PlayerID: "p1", Skill: 1050, EnqueuedAt: time.Now()})
 	c.Cancel(ctx, "p1")
 
-	// queue_entry must be deleted so the worker skips the player on next pop
-	exists, _ := rdb.Exists(ctx, rediskeys.QueueEntry("p1")).Result()
-	if exists != 0 {
-		t.Fatal("expected entry key to be deleted after cancel")
-	}
-
-	// player must appear in the cancelled set
 	shard := model.Shard{Region: "test", Mode: "casual"}
 	isMember, _ := rdb.SIsMember(ctx, rediskeys.Cancelled(shard), "p1").Result()
 	if !isMember {
@@ -77,8 +62,7 @@ func TestGetMatchNotFound(t *testing.T) {
 	}
 }
 
-// TestJoinRejectedAfterCancel covers the Cancel-before-Join race: a player who
-// calls Cancel must not be re-admitted to the queue by a concurrent Join.
+// TestJoinRejectedAfterCancel covers the Cancel-before-Join race.
 func TestJoinRejectedAfterCancel(t *testing.T) {
 	c, rdb := newTestClient(t)
 	ctx := context.Background()
@@ -96,10 +80,6 @@ func TestJoinRejectedAfterCancel(t *testing.T) {
 	n, _ := rdb.ZCard(ctx, rediskeys.Queue(shard)).Result()
 	if n != 0 {
 		t.Fatalf("expected empty sorted set, got %d", n)
-	}
-	exists, _ := rdb.Exists(ctx, rediskeys.QueueEntry("p1")).Result()
-	if exists != 0 {
-		t.Fatal("expected no queue entry key")
 	}
 }
 
