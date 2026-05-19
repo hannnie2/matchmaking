@@ -8,6 +8,7 @@ import (
 	"matchmaking/internal/model"
 	"matchmaking/internal/rediskeys"
 	"os"
+	"sync/atomic"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -62,19 +63,21 @@ return 1
 `)
 
 type MatchMaker struct {
-	matchSize int
-	shard     model.Shard
-	rdb       *redis.Client
-	workerID  string
-	matchSeq  int64
+	matchSize   int
+	concurrency int
+	shard       model.Shard
+	rdb         *redis.Client
+	workerID    string
+	matchSeq    atomic.Int64
 }
 
-func New(shard model.Shard, rdb *redis.Client, matchSize int) *MatchMaker {
+func New(shard model.Shard, rdb *redis.Client, matchSize, concurrency int) *MatchMaker {
 	return &MatchMaker{
-		matchSize: matchSize,
-		shard:     shard,
-		rdb:       rdb,
-		workerID:  newWorkerID(),
+		matchSize:   matchSize,
+		concurrency: concurrency,
+		shard:       shard,
+		rdb:         rdb,
+		workerID:    newWorkerID(),
 	}
 }
 
@@ -91,7 +94,9 @@ func (m *MatchMaker) Run(ctx context.Context) error {
 
 	g, ctx := errgroup.WithContext(ctx)
 	g.Go(func() error { return m.renewLockLoop(ctx) })
-	g.Go(func() error { return m.popLoop(ctx) })
+	for range m.concurrency {
+		g.Go(func() error { return m.popLoop(ctx) })
+	}
 	return g.Wait()
 }
 
@@ -236,14 +241,14 @@ func (m *MatchMaker) popOnce(ctx context.Context, buffer []bufferedEntry) ([]buf
 // match record, and deletes queue entries. Returns false if a cancellation is
 // detected — the caller is responsible for re-pushing the group.
 func (m *MatchMaker) commitMatch(ctx context.Context, group []bufferedEntry) (bool, error) {
-	m.matchSeq++
+	seq := m.matchSeq.Add(1)
 	playerIDs := make([]string, len(group))
 	for i, be := range group {
 		playerIDs[i] = be.entry.PlayerID
 	}
 
 	match := &model.Match{
-		ID:        fmt.Sprintf("match-%d-%d", time.Now().UnixMilli(), m.matchSeq),
+		ID:        fmt.Sprintf("match-%d-%d", time.Now().UnixMilli(), seq),
 		PlayerIDs: playerIDs,
 		Status:    model.MatchStatusForming,
 		FormedAt:  time.Now(),

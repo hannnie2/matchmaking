@@ -20,7 +20,7 @@ func newTestSetup(t *testing.T) (*MatchMaker, *queue.Client, *redis.Client) {
 	rdb := redis.NewClient(&redis.Options{Addr: s.Addr()})
 	workerShard := model.Shard{Region: "test", Mode: "casual", SkillBand: "1000-1200"}
 	clientShard := model.Shard{Region: "test", Mode: "casual"}
-	return New(workerShard, rdb, testMatchSize), queue.New(clientShard, rdb), rdb
+	return New(workerShard, rdb, testMatchSize, 1), queue.New(clientShard, rdb), rdb
 }
 
 func entry(playerID string, skill float64) *model.QueueEntry {

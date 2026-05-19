@@ -24,7 +24,8 @@ func main() {
 			SkillBand: envOr("SHARD_SKILLBAND", "1000-1200"),
 		},
 		rdb,
-		24,
+		24, // matchSize
+		4,  // concurrency
 	)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
