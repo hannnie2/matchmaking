@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"matchmaking/internal/api"
 	"matchmaking/internal/model"
+	"matchmaking/internal/publish"
 	"matchmaking/internal/queue"
 	"net/http"
 	"os"
@@ -20,19 +21,18 @@ func main() {
 		Addr: envOr("REDIS_ADDR", "localhost:6379"),
 	})
 
-	q := queue.New(
-		model.Shard{
-			Region: envOr("SHARD_REGION", "NA-E"),
-			Mode:   envOr("SHARD_MODE", "ranked"),
-		},
-		rdb,
-	)
+	shard := model.Shard{
+		Region: envOr("SHARD_REGION", "NA-E"),
+		Mode:   envOr("SHARD_MODE", "ranked"),
+	}
+	q := queue.New(shard, rdb)
+	pub := publish.New(rdb)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 
 	mux := http.NewServeMux()
-	api.NewHandler(q).RegisterRoutes(mux)
+	api.NewHandler(q, rdb, pub).RegisterRoutes(mux)
 	server := &http.Server{Addr: ":8080", Handler: mux}
 
 	go func() {

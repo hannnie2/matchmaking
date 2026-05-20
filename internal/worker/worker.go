@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"matchmaking/internal/model"
+	"matchmaking/internal/publish"
 	"matchmaking/internal/rediskeys"
 	"os"
 	"sync/atomic"
@@ -19,7 +20,7 @@ const (
 	lockTTL           = 5 * time.Second
 	lockRenewInterval = 2 * time.Second
 	matchTTL          = 10 * time.Minute
-	popBatchSize      = 16
+	popBatchSize      = 24
 	emptyQueueDelay   = 100 * time.Millisecond
 )
 
@@ -39,41 +40,47 @@ else
 end
 `)
 
-// commitMatchScript atomically checks that none of the players appear in the
-// cancelled set before writing the match record.
+// commitMatchScript atomically checks the cancelled set, writes the match
+// record, sets the status key, and adds the match to the forming set.
 //
 // KEYS[1]    = cancelled:{region}:{mode}
 // KEYS[2]    = match:{matchID}
+// KEYS[3]    = matches:forming
+// KEYS[4]    = match:{matchID}:status
 // ARGV[1..N] = playerIDs
 // ARGV[N+1]  = match JSON
 // ARGV[N+2]  = TTL seconds
+// ARGV[N+3]  = formation score (UnixMilli)
+// ARGV[N+4]  = matchID
 var commitMatchScript = redis.NewScript(`
-local n = #ARGV - 2
+local n = #ARGV - 4
 for i = 1, n do
     if redis.call("SISMEMBER", KEYS[1], ARGV[i]) == 1 then
         return 0
     end
 end
-redis.call("SET", KEYS[2], ARGV[n + 1], "EX", tonumber(ARGV[n + 2]))
+redis.call("SET", KEYS[2], ARGV[n+1], "EX", tonumber(ARGV[n+2]))
+redis.call("SET", KEYS[4], "forming", "EX", tonumber(ARGV[n+2]))
+redis.call("ZADD", KEYS[3], tonumber(ARGV[n+3]), ARGV[n+4])
 return 1
 `)
 
 type MatchMaker struct {
-	matchSize   int
-	concurrency int
-	shard       model.Shard
-	rdb         *redis.Client
-	workerID    string
-	matchSeq    atomic.Int64
+	matchSize int
+	shard     model.Shard
+	rdb       *redis.Client
+	pub       *publish.Publisher // nil = no-op
+	workerID  string
+	matchSeq  atomic.Int64
 }
 
-func New(shard model.Shard, rdb *redis.Client, matchSize, concurrency int) *MatchMaker {
+func New(shard model.Shard, rdb *redis.Client, pub *publish.Publisher, matchSize int) *MatchMaker {
 	return &MatchMaker{
-		matchSize:   matchSize,
-		concurrency: concurrency,
-		shard:       shard,
-		rdb:         rdb,
-		workerID:    newWorkerID(),
+		matchSize: matchSize,
+		shard:     shard,
+		rdb:       rdb,
+		pub:       pub,
+		workerID:  newWorkerID(),
 	}
 }
 
@@ -90,9 +97,7 @@ func (m *MatchMaker) Run(ctx context.Context) error {
 
 	g, ctx := errgroup.WithContext(ctx)
 	g.Go(func() error { return m.renewLockLoop(ctx) })
-	for range m.concurrency {
-		g.Go(func() error { return m.popLoop(ctx) })
-	}
+	g.Go(func() error { return m.popLoop(ctx) })
 	return g.Wait()
 }
 
@@ -252,34 +257,48 @@ func (m *MatchMaker) popOnce(ctx context.Context, buffer []bufferedEntry) ([]buf
 }
 
 // commitMatch atomically verifies no player has been cancelled, writes the
-// match record, and deletes queue entries. Returns false if a cancellation is
-// detected — the caller is responsible for re-pushing the group.
+// match record, sets the status key, and registers the match in the forming
+// set. Returns false if a cancellation is detected.
 func (m *MatchMaker) commitMatch(ctx context.Context, group []bufferedEntry) (bool, error) {
 	seq := m.matchSeq.Add(1)
+	now := time.Now()
+
 	playerIDs := make([]string, len(group))
+	entries := make([]model.QueueEntry, len(group))
 	for i, be := range group {
 		playerIDs[i] = be.entry.PlayerID
+		entries[i] = *be.entry
 	}
 
 	match := &model.Match{
-		ID:        fmt.Sprintf("match-%d-%d", time.Now().UnixMilli(), seq),
+		ID:        fmt.Sprintf("match-%d-%d", now.UnixMilli(), seq),
+		Shard:     model.Shard{Region: m.shard.Region, Mode: m.shard.Mode},
 		PlayerIDs: playerIDs,
+		Entries:   entries,
 		Status:    model.MatchStatusForming,
-		FormedAt:  time.Now(),
+		FormedAt:  now,
 	}
 	matchData, err := json.Marshal(match)
 	if err != nil {
 		return false, err
 	}
 
-	keys := []string{rediskeys.Cancelled(m.shard), rediskeys.Match(match.ID)}
-
-	// ARGV: playerIDs..., match JSON, TTL
-	args := make([]interface{}, 0, len(playerIDs)+2)
+	keys := []string{
+		rediskeys.Cancelled(m.shard),
+		rediskeys.Match(match.ID),
+		rediskeys.FormingMatches(),
+		rediskeys.MatchStatusKey(match.ID),
+	}
+	args := make([]interface{}, 0, len(playerIDs)+4)
 	for _, id := range playerIDs {
 		args = append(args, id)
 	}
-	args = append(args, string(matchData), int(matchTTL.Seconds()))
+	args = append(args,
+		string(matchData),
+		int(matchTTL.Seconds()),
+		now.UnixMilli(),
+		match.ID,
+	)
 
 	result, err := commitMatchScript.Run(ctx, m.rdb, keys, args...).Int()
 	if err != nil {
@@ -290,6 +309,12 @@ func (m *MatchMaker) commitMatch(ctx context.Context, group []bufferedEntry) (bo
 	}
 
 	slog.Info("match formed", "match_id", match.ID, "players", playerIDs)
+	if m.pub != nil {
+		m.pub.Publish(ctx, publish.ChannelMatchForming, publish.MatchFormingEvent{
+			MatchID:   match.ID,
+			PlayerIDs: playerIDs,
+		})
+	}
 	return true, nil
 }
 
