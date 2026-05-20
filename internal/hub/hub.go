@@ -113,7 +113,11 @@ func (h *Hub) processEvent(ctx context.Context, channel string, payload []byte) 
 			pipe.Set(ctx, rediskeys.PendingMatchEvent(pid), frame, pendingEventTTL)
 		}
 		pipe.Exec(ctx)
-		h.fanout <- fanoutMsg{playerIDs: ev.PlayerIDs, frame: frame}
+		select {
+		case h.fanout <- fanoutMsg{playerIDs: ev.PlayerIDs, frame: frame}:
+		case <-ctx.Done():
+			return
+		}
 
 	case publish.ChannelMatchConfirmed:
 		var ev publish.MatchConfirmedEvent
@@ -126,7 +130,11 @@ func (h *Hub) processEvent(ctx context.Context, channel string, payload []byte) 
 			pipe.Del(ctx, rediskeys.PendingMatchEvent(pid))
 		}
 		pipe.Exec(ctx)
-		h.fanout <- fanoutMsg{playerIDs: ev.PlayerIDs, frame: frame}
+		select {
+		case h.fanout <- fanoutMsg{playerIDs: ev.PlayerIDs, frame: frame}:
+		case <-ctx.Done():
+			return
+		}
 
 	case publish.ChannelMatchDissolved:
 		var ev publish.MatchDissolvedEvent
@@ -139,7 +147,11 @@ func (h *Hub) processEvent(ctx context.Context, channel string, payload []byte) 
 			pipe.Del(ctx, rediskeys.PendingMatchEvent(pid))
 		}
 		pipe.Exec(ctx)
-		h.fanout <- fanoutMsg{playerIDs: ev.PlayerIDs, frame: frame}
+		select {
+		case h.fanout <- fanoutMsg{playerIDs: ev.PlayerIDs, frame: frame}:
+		case <-ctx.Done():
+			return
+		}
 
 	case publish.ChannelMatchServerReady:
 		var ev publish.MatchServerReadyEvent
@@ -147,7 +159,11 @@ func (h *Hub) processEvent(ctx context.Context, channel string, payload []byte) 
 			return
 		}
 		frame := h.encode(wsEvent{Type: "match.server_ready", MatchID: ev.MatchID, ServerAddr: ev.ServerAddr})
-		h.fanout <- fanoutMsg{playerIDs: ev.PlayerIDs, frame: frame}
+		select {
+		case h.fanout <- fanoutMsg{playerIDs: ev.PlayerIDs, frame: frame}:
+		case <-ctx.Done():
+			return
+		}
 	}
 }
 

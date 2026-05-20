@@ -15,11 +15,11 @@ import (
 
 const responseTTL = 10 * time.Minute
 
-// acceptScript atomically increments the accepted counter for a match.
-// Returns -1 if the match status key is missing (expired/not found),
-// -2 if the player already declined, or the new accepted count on success.
+// acceptScript atomically records a player's acceptance for a match.
+// Returns -1 if the match is not in forming state, -2 if the player already
+// declined, -3 if the player already accepted, or the distinct accepted count.
 //
-// KEYS[1] = match:{id}:accepted
+// KEYS[1] = match:{id}:accepted  (set of player IDs)
 // KEYS[2] = match:{id}:declined
 // KEYS[3] = match:{id}:status
 // ARGV[1] = playerID
@@ -28,9 +28,9 @@ var acceptScript = redis.NewScript(`
 local status = redis.call("GET", KEYS[3])
 if not status or status ~= "forming" then return -1 end
 if redis.call("SISMEMBER", KEYS[2], ARGV[1]) == 1 then return -2 end
-local count = redis.call("INCR", KEYS[1])
+if redis.call("SADD", KEYS[1], ARGV[1]) == 0 then return -3 end
 redis.call("EXPIRE", KEYS[1], tonumber(ARGV[2]))
-return count
+return redis.call("SCARD", KEYS[1])
 `)
 
 // declineScript atomically adds the player to the declined set.
@@ -161,6 +161,9 @@ func (h *Handler) accept(w http.ResponseWriter, r *http.Request) {
 		return
 	case -2:
 		http.Error(w, "player already declined", http.StatusConflict)
+		return
+	case -3:
+		w.WriteHeader(http.StatusNoContent) // duplicate accept is a no-op
 		return
 	}
 
