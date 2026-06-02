@@ -7,6 +7,7 @@ import (
 	"matchmaking/internal/publish"
 	"matchmaking/internal/queue"
 	"matchmaking/internal/rediskeys"
+	"matchmaking/internal/store"
 	"net/http"
 	"time"
 
@@ -53,10 +54,11 @@ type Handler struct {
 	q   *queue.Client
 	rdb *redis.Client
 	pub *publish.Publisher
+	st  *store.Store
 }
 
-func NewHandler(q *queue.Client, rdb *redis.Client, pub *publish.Publisher) *Handler {
-	return &Handler{q: q, rdb: rdb, pub: pub}
+func NewHandler(q *queue.Client, rdb *redis.Client, pub *publish.Publisher, st *store.Store) *Handler {
+	return &Handler{q: q, rdb: rdb, pub: pub, st: st}
 }
 
 func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
@@ -69,19 +71,32 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 
 func (h *Handler) join(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		PlayerID string  `json:"player_id"`
-		Skill    float64 `json:"skill"`
+		PlayerID string `json:"player_id"`
+		Region   string `json:"region"`
+		Mode     string `json:"mode"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.PlayerID == "" {
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.PlayerID == "" || body.Region == "" || body.Mode == "" {
 		http.Error(w, "invalid request body", http.StatusBadRequest)
 		return
 	}
+
+	player, err := h.st.GetPlayer(r.Context(), body.PlayerID)
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if player == nil {
+		http.Error(w, "player not found", http.StatusNotFound)
+		return
+	}
+
+	shard := model.Shard{Region: body.Region, Mode: body.Mode}
 	entry := &model.QueueEntry{
-		PlayerID:   body.PlayerID,
-		Skill:      body.Skill,
+		PlayerID:   player.ID,
+		Rating:     player.Rating,
 		EnqueuedAt: time.Now(),
 	}
-	if err := h.q.Join(r.Context(), entry); err != nil {
+	if err := h.q.Join(r.Context(), shard, entry); err != nil {
 		http.Error(w, "failed to join queue", http.StatusInternalServerError)
 		return
 	}
@@ -91,12 +106,15 @@ func (h *Handler) join(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) cancel(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		PlayerID string `json:"player_id"`
+		Region   string `json:"region"`
+		Mode     string `json:"mode"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.PlayerID == "" {
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.PlayerID == "" || body.Region == "" || body.Mode == "" {
 		http.Error(w, "invalid request body", http.StatusBadRequest)
 		return
 	}
-	if err := h.q.Cancel(r.Context(), body.PlayerID); err != nil {
+	shard := model.Shard{Region: body.Region, Mode: body.Mode}
+	if err := h.q.Cancel(r.Context(), shard, body.PlayerID); err != nil {
 		http.Error(w, "failed to cancel", http.StatusInternalServerError)
 		return
 	}
@@ -168,7 +186,7 @@ func (h *Handler) accept(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if result == len(match.PlayerIDs) {
-		matchops.Confirm(r.Context(), h.rdb, h.pub, matchID)
+		matchops.Confirm(r.Context(), h.rdb, h.pub, h.st, matchID)
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -201,7 +219,7 @@ func (h *Handler) decline(w http.ResponseWriter, r *http.Request) {
 
 	if result == 1 {
 		// First decline — dissolve the match and re-queue the rest.
-		matchops.Dissolve(r.Context(), h.rdb, h.pub, matchID, body.PlayerID)
+		matchops.Dissolve(r.Context(), h.rdb, h.pub, h.st, matchID, body.PlayerID)
 	}
 	w.WriteHeader(http.StatusNoContent)
 }

@@ -54,26 +54,25 @@ return 1
 `)
 
 type Client struct {
-	rdb   *redis.Client
-	shard model.Shard // SkillBand is empty; derived per-player in Join
+	rdb *redis.Client
 }
 
-func New(shard model.Shard, rdb *redis.Client) *Client {
-	return &Client{rdb: rdb, shard: shard}
+func New(rdb *redis.Client) *Client {
+	return &Client{rdb: rdb}
 }
 
-func (c *Client) Join(ctx context.Context, entry *model.QueueEntry) error {
+func (c *Client) Join(ctx context.Context, shard model.Shard, entry *model.QueueEntry) error {
 	data, err := json.Marshal(entry)
 	if err != nil {
 		return err
 	}
-	shard := model.Shard{
-		Region:    c.shard.Region,
-		Mode:      c.shard.Mode,
-		SkillBand: computeSkillBand(entry.Skill),
+	qShard := model.Shard{
+		Region:     shard.Region,
+		Mode:       shard.Mode,
+		RatingBand: computeRatingBand(entry.Rating),
 	}
 	result, err := joinScript.Run(ctx, c.rdb,
-		[]string{rediskeys.Queue(shard), rediskeys.Cancelled(shard)},
+		[]string{rediskeys.Queue(qShard), rediskeys.Cancelled(qShard)},
 		fmt.Sprintf("%d", entry.EnqueuedAt.UnixMilli()),
 		entry.PlayerID,
 		string(data),
@@ -90,9 +89,9 @@ func (c *Client) Join(ctx context.Context, entry *model.QueueEntry) error {
 // Cancel records the cancellation atomically. The player's JSON member remains
 // in the sorted set until the worker pops it; the cancelled set causes the
 // worker to discard them before buffering.
-func (c *Client) Cancel(ctx context.Context, playerID string) error {
+func (c *Client) Cancel(ctx context.Context, shard model.Shard, playerID string) error {
 	return cancelScript.Run(ctx, c.rdb,
-		[]string{rediskeys.Cancelled(c.shard)},
+		[]string{rediskeys.Cancelled(shard)},
 		playerID, int(cancelledSetTTL.Seconds()),
 	).Err()
 }
@@ -113,16 +112,16 @@ func (c *Client) GetMatch(ctx context.Context, matchID string) (*model.Match, er
 	return &match, nil
 }
 
-// computeSkillBand returns the skill band key for a given skill value.
+// computeRatingBand returns the rating band key for a given rating value.
 // Bands are [1000,1200), [1200,1400), ..., [2200,2400].
-func computeSkillBand(skill float64) string {
-	s := int(skill)
-	if s < skillBandMin {
-		s = skillBandMin
+func computeRatingBand(rating float64) string {
+	r := int(rating)
+	if r < skillBandMin {
+		r = skillBandMin
 	}
-	if s >= skillBandMax {
-		s = skillBandMax - skillBandWidth
+	if r >= skillBandMax {
+		r = skillBandMax - skillBandWidth
 	}
-	lower := (s / skillBandWidth) * skillBandWidth
+	lower := (r / skillBandWidth) * skillBandWidth
 	return fmt.Sprintf("%d-%d", lower, lower+skillBandWidth)
 }

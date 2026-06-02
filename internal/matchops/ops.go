@@ -9,6 +9,7 @@ import (
 	"matchmaking/internal/publish"
 	"matchmaking/internal/queue"
 	"matchmaking/internal/rediskeys"
+	"matchmaking/internal/store"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -33,7 +34,7 @@ return 1
 // Dissolve transitions a match from forming → dissolved, re-queues all players
 // except the one who explicitly declined, and publishes match.dissolved.
 // It is idempotent: concurrent calls for the same match are safe.
-func Dissolve(ctx context.Context, rdb *redis.Client, pub *publish.Publisher, matchID, declinedPlayerID string) {
+func Dissolve(ctx context.Context, rdb *redis.Client, pub *publish.Publisher, st *store.Store, matchID, declinedPlayerID string) {
 	ok, err := transitionStatusScript.Run(ctx, rdb,
 		[]string{rediskeys.MatchStatusKey(matchID)},
 		string(model.MatchStatusForming),
@@ -51,13 +52,14 @@ func Dissolve(ctx context.Context, rdb *redis.Client, pub *publish.Publisher, ma
 
 	rdb.ZRem(ctx, rediskeys.FormingMatches(), matchID)
 
-	matchQ := queue.New(model.Shard{Region: match.Shard.Region, Mode: match.Shard.Mode}, rdb)
+	matchQ := queue.New(rdb)
+	requeueShard := model.Shard{Region: match.Shard.Region, Mode: match.Shard.Mode}
 	for i := range match.Entries {
 		e := &match.Entries[i]
 		if e.PlayerID == declinedPlayerID {
 			continue
 		}
-		if err := matchQ.Join(ctx, e); err != nil {
+		if err := matchQ.Join(ctx, requeueShard, e); err != nil {
 			slog.Error("failed to re-queue player on dissolve", "player_id", e.PlayerID, "err", err)
 		}
 	}
@@ -67,12 +69,20 @@ func Dissolve(ctx context.Context, rdb *redis.Client, pub *publish.Publisher, ma
 		PlayerIDs: match.PlayerIDs,
 	})
 	slog.Info("match dissolved", "match_id", matchID)
+	if st != nil {
+		now := time.Now()
+		go func() {
+			if err := st.MarkMatchDissolved(context.Background(), matchID, now); err != nil {
+				slog.Error("failed to persist match dissolution", "match_id", matchID, "err", err)
+			}
+		}()
+	}
 }
 
 // Confirm transitions a match from forming → confirmed and publishes
 // match.confirmed. Game server allocation is triggered by the caller.
 // It is idempotent: concurrent calls for the same match are safe.
-func Confirm(ctx context.Context, rdb *redis.Client, pub *publish.Publisher, matchID string) {
+func Confirm(ctx context.Context, rdb *redis.Client, pub *publish.Publisher, st *store.Store, matchID string) {
 	ok, err := transitionStatusScript.Run(ctx, rdb,
 		[]string{rediskeys.MatchStatusKey(matchID)},
 		string(model.MatchStatusForming),
@@ -95,6 +105,14 @@ func Confirm(ctx context.Context, rdb *redis.Client, pub *publish.Publisher, mat
 		PlayerIDs: playerIDs,
 	})
 	slog.Info("match confirmed", "match_id", matchID)
+	if st != nil {
+		now := time.Now()
+		go func() {
+			if err := st.MarkMatchConfirmed(context.Background(), matchID, now); err != nil {
+				slog.Error("failed to persist match confirmation", "match_id", matchID, "err", err)
+			}
+		}()
+	}
 
 	go allocateServer(pub, matchID, playerIDs)
 }

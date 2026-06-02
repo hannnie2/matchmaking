@@ -8,6 +8,7 @@ import (
 	"matchmaking/internal/model"
 	"matchmaking/internal/publish"
 	"matchmaking/internal/rediskeys"
+	"matchmaking/internal/store"
 	"os"
 	"sync/atomic"
 	"time"
@@ -70,16 +71,18 @@ type MatchMaker struct {
 	shard     model.Shard
 	rdb       *redis.Client
 	pub       *publish.Publisher // nil = no-op
+	st        *store.Store       // nil = no-op
 	workerID  string
 	matchSeq  atomic.Int64
 }
 
-func New(shard model.Shard, rdb *redis.Client, pub *publish.Publisher, matchSize int) *MatchMaker {
+func New(shard model.Shard, rdb *redis.Client, pub *publish.Publisher, matchSize int, st *store.Store) *MatchMaker {
 	return &MatchMaker{
 		matchSize: matchSize,
 		shard:     shard,
 		rdb:       rdb,
 		pub:       pub,
+		st:        st,
 		workerID:  newWorkerID(),
 	}
 }
@@ -272,7 +275,7 @@ func (m *MatchMaker) commitMatch(ctx context.Context, group []bufferedEntry) (bo
 
 	match := &model.Match{
 		ID:        fmt.Sprintf("match-%d-%d", now.UnixMilli(), seq),
-		Shard:     model.Shard{Region: m.shard.Region, Mode: m.shard.Mode},
+		Shard:     m.shard,
 		PlayerIDs: playerIDs,
 		Entries:   entries,
 		Status:    model.MatchStatusForming,
@@ -314,6 +317,14 @@ func (m *MatchMaker) commitMatch(ctx context.Context, group []bufferedEntry) (bo
 			MatchID:   match.ID,
 			PlayerIDs: playerIDs,
 		})
+	}
+	if m.st != nil {
+		st, snap := m.st, match
+		go func() {
+			if err := st.InsertMatch(context.Background(), snap); err != nil {
+				slog.Error("failed to persist match", "match_id", snap.ID, "err", err)
+			}
+		}()
 	}
 	return true, nil
 }

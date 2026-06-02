@@ -5,20 +5,20 @@ import (
 	"matchmaking/internal/model"
 )
 
-// Queue is the sorted set for a specific skill band. Score = enqueue time
+// Queue is the sorted set for a specific rating band. Score = enqueue time
 // (UnixMilli); member = serialised QueueEntry JSON.
 func Queue(shard model.Shard) string {
-	return fmt.Sprintf("q:%s:%s:%s", shard.Region, shard.Mode, shard.SkillBand)
+	return fmt.Sprintf("q:%s:%s:%s", shard.Region, shard.Mode, shard.RatingBand)
 }
 func Match(matchID string) string          { return "match:" + matchID }
 func MatchStatusKey(matchID string) string { return "match:" + matchID + ":status" }
 func MatchAccepted(matchID string) string  { return "match:" + matchID + ":accepted" }
 func MatchDeclined(matchID string) string  { return "match:" + matchID + ":declined" }
 func ShardLock(shard model.Shard) string {
-	return fmt.Sprintf("lock:%s:%s:%s", shard.Region, shard.Mode, shard.SkillBand)
+	return fmt.Sprintf("lock:%s:%s:%s", shard.Region, shard.Mode, shard.RatingBand)
 }
 
-// Cancelled is per (region, mode) only — Cancel does not know the player's skill band.
+// Cancelled is per (region, mode) only — Cancel does not know the player's rating band.
 func Cancelled(shard model.Shard) string {
 	return fmt.Sprintf("cancelled:%s:%s", shard.Region, shard.Mode)
 }

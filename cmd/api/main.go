@@ -5,9 +5,9 @@ import (
 	"errors"
 	"log/slog"
 	"matchmaking/internal/api"
-	"matchmaking/internal/model"
 	"matchmaking/internal/publish"
 	"matchmaking/internal/queue"
+	"matchmaking/internal/store"
 	"net/http"
 	"os"
 	"os/signal"
@@ -21,18 +21,21 @@ func main() {
 		Addr: envOr("REDIS_ADDR", "localhost:6379"),
 	})
 
-	shard := model.Shard{
-		Region: envOr("SHARD_REGION", "NA-E"),
-		Mode:   envOr("SHARD_MODE", "ranked"),
-	}
-	q := queue.New(shard, rdb)
+	q := queue.New(rdb)
 	pub := publish.New(rdb)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 
+	st, err := store.New(ctx, envOr("POSTGRES_DSN", "postgres://matchmaking:matchmaking@localhost:5432/matchmaking"))
+	if err != nil {
+		slog.Error("failed to connect to postgres", "err", err)
+		os.Exit(1)
+	}
+	defer st.Close()
+
 	mux := http.NewServeMux()
-	api.NewHandler(q, rdb, pub).RegisterRoutes(mux)
+	api.NewHandler(q, rdb, pub, st).RegisterRoutes(mux)
 	server := &http.Server{Addr: ":8080", Handler: mux}
 
 	go func() {

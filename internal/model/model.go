@@ -5,22 +5,30 @@ import (
 	"time"
 )
 
+type Player struct {
+	ID          string
+	Rating      float64
+	GamesPlayed int
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
+}
+
 type Shard struct {
 	Region    string `json:"region"`
 	Mode      string `json:"mode"`
-	SkillBand string `json:"skill_band,omitempty"`
+	RatingBand string `json:"rating_band,omitempty"`
 }
 
 func (s Shard) String() string {
-	if s.SkillBand != "" {
-		return fmt.Sprintf("%s/%s/%s", s.Region, s.Mode, s.SkillBand)
+	if s.RatingBand != "" {
+		return fmt.Sprintf("%s/%s/%s", s.Region, s.Mode, s.RatingBand)
 	}
 	return fmt.Sprintf("%s/%s", s.Region, s.Mode)
 }
 
 type QueueEntry struct {
 	PlayerID   string    `json:"player_id"`
-	Skill      float64   `json:"skill"`
+	Rating     float64   `json:"rating"`
 	EnqueuedAt time.Time `json:"enqueued_at"`
 }
 

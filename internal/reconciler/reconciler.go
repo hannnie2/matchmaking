@@ -53,6 +53,6 @@ func (r *Reconciler) processTimedOut(ctx context.Context) {
 
 	for _, matchID := range matchIDs {
 		slog.Info("reconciler: dissolving timed-out match", "match_id", matchID)
-		matchops.Dissolve(ctx, r.rdb, r.pub, matchID, "")
+		matchops.Dissolve(ctx, r.rdb, r.pub, nil, matchID, "")
 	}
 }
