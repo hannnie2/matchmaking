@@ -110,7 +110,7 @@ func Dissolve(ctx context.Context, rdb *redis.Client, pub *publish.Publisher, st
 		[]string{
 			rediskeys.MatchStatusKey(matchID),
 			rediskeys.Match(matchID),
-			rediskeys.FormingMatches(),
+			rediskeys.FormingMatches(match.Shard),
 			rediskeys.Queue(match.Shard),
 			rediskeys.Cancelled(match.Shard),
 		},
@@ -139,14 +139,18 @@ func Dissolve(ctx context.Context, rdb *redis.Client, pub *publish.Publisher, st
 // match.confirmed. Game server allocation is triggered after confirmation.
 // It is idempotent: the Lua script's status check prevents double-execution.
 func Confirm(ctx context.Context, rdb *redis.Client, pub *publish.Publisher, st *store.Store, matchID string) {
-	// Read before the script so we have player IDs for the publish event.
+	// Read the match first: we need match.Shard to construct the forming-set key,
+	// and match.PlayerIDs for the publish event.
 	match := readMatch(ctx, rdb, matchID)
+	if match == nil {
+		return
+	}
 
 	ok, err := confirmScript.Run(ctx, rdb,
 		[]string{
 			rediskeys.MatchStatusKey(matchID),
 			rediskeys.Match(matchID),
-			rediskeys.FormingMatches(),
+			rediskeys.FormingMatches(match.Shard),
 		},
 		int(MatchTTL.Seconds()), matchID,
 	).Int()
@@ -154,13 +158,9 @@ func Confirm(ctx context.Context, rdb *redis.Client, pub *publish.Publisher, st 
 		return
 	}
 
-	var playerIDs []string
-	if match != nil {
-		playerIDs = match.PlayerIDs
-	}
 	pub.Publish(ctx, publish.ChannelMatchConfirmed, publish.MatchConfirmedEvent{
 		MatchID:   matchID,
-		PlayerIDs: playerIDs,
+		PlayerIDs: match.PlayerIDs,
 	})
 	slog.Info("match confirmed", "match_id", matchID)
 	if st != nil {
@@ -172,7 +172,7 @@ func Confirm(ctx context.Context, rdb *redis.Client, pub *publish.Publisher, st 
 		}()
 	}
 
-	go allocateServer(pub, matchID, playerIDs)
+	go allocateServer(pub, matchID, match.PlayerIDs)
 }
 
 func allocateServer(pub *publish.Publisher, matchID string, playerIDs []string) {

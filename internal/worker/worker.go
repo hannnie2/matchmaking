@@ -274,7 +274,7 @@ func (m *MatchMaker) commitMatch(ctx context.Context, group []bufferedEntry) (bo
 	}
 
 	match := &model.Match{
-		ID:        fmt.Sprintf("match-%d-%d", now.UnixMilli(), seq),
+		ID:        fmt.Sprintf("{%s/%s}:%s:%d:%d", m.shard.Region, m.shard.Mode, m.shard.RatingBand, now.UnixMilli(), seq),
 		Shard:     m.shard,
 		PlayerIDs: playerIDs,
 		Entries:   entries,
@@ -289,7 +289,7 @@ func (m *MatchMaker) commitMatch(ctx context.Context, group []bufferedEntry) (bo
 	keys := []string{
 		rediskeys.Cancelled(m.shard),
 		rediskeys.Match(match.ID),
-		rediskeys.FormingMatches(),
+		rediskeys.FormingMatches(m.shard),
 		rediskeys.MatchStatusKey(match.ID),
 	}
 	args := make([]interface{}, 0, len(playerIDs)+4)
