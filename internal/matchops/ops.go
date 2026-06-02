@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"matchmaking/internal/model"
 	"matchmaking/internal/publish"
-	"matchmaking/internal/queue"
 	"matchmaking/internal/rediskeys"
 	"matchmaking/internal/store"
 	"time"
@@ -17,51 +16,108 @@ import (
 
 const MatchTTL = 10 * time.Minute
 
-// transitionStatusScript atomically moves a match from one status to another.
-// Returns 0 if the match is missing or not in the expected status (idempotent).
+// dissolveScript atomically transitions a match from forming → dissolved,
+// removes it from the forming set, updates the match JSON, and re-queues all
+// entries except the declined player (skipping any that are in the cancelled set).
 //
 // KEYS[1] = match:{id}:status
-// ARGV[1] = expected status
-// ARGV[2] = new status
-// ARGV[3] = TTL seconds
-var transitionStatusScript = redis.NewScript(`
-local current = redis.call("GET", KEYS[1])
-if not current or current ~= ARGV[1] then return 0 end
-redis.call("SET", KEYS[1], ARGV[2], "EX", tonumber(ARGV[3]))
+// KEYS[2] = match:{id}
+// KEYS[3] = matches:forming
+// KEYS[4] = q:{region}:{mode}:{ratingBand}
+// KEYS[5] = cancelled:{region}:{mode}
+// ARGV[1] = TTL seconds
+// ARGV[2] = matchID
+// ARGV[3] = declined player ID (empty string if none)
+// ARGV[4,7,10,...] = playerID
+// ARGV[5,8,11,...] = score (UnixMilli string)
+// ARGV[6,9,12,...] = entry JSON member
+var dissolveScript = redis.NewScript(`
+local status = redis.call("GET", KEYS[1])
+if not status or status ~= "forming" then return 0 end
+
+redis.call("SET", KEYS[1], "dissolved", "EX", tonumber(ARGV[1]))
+redis.call("ZREM", KEYS[3], ARGV[2])
+
+local raw = redis.call("GET", KEYS[2])
+if raw then
+    local m = cjson.decode(raw)
+    m["status"] = "dissolved"
+    redis.call("SET", KEYS[2], cjson.encode(m), "EX", tonumber(ARGV[1]))
+end
+
+local declined = ARGV[3]
+local i = 4
+while i <= #ARGV do
+    local pid    = ARGV[i]
+    local score  = ARGV[i+1]
+    local member = ARGV[i+2]
+    if pid ~= declined and redis.call("SISMEMBER", KEYS[5], pid) == 0 then
+        redis.call("ZADD", KEYS[4], tonumber(score), member)
+    end
+    i = i + 3
+end
+
+return 1
+`)
+
+// confirmScript atomically transitions a match from forming → confirmed,
+// removes it from the forming set, and updates the match JSON.
+//
+// KEYS[1] = match:{id}:status
+// KEYS[2] = match:{id}
+// KEYS[3] = matches:forming
+// ARGV[1] = TTL seconds
+// ARGV[2] = matchID
+var confirmScript = redis.NewScript(`
+local status = redis.call("GET", KEYS[1])
+if not status or status ~= "forming" then return 0 end
+
+redis.call("SET", KEYS[1], "confirmed", "EX", tonumber(ARGV[1]))
+redis.call("ZREM", KEYS[3], ARGV[2])
+
+local raw = redis.call("GET", KEYS[2])
+if raw then
+    local m = cjson.decode(raw)
+    m["status"] = "confirmed"
+    redis.call("SET", KEYS[2], cjson.encode(m), "EX", tonumber(ARGV[1]))
+end
+
 return 1
 `)
 
 // Dissolve transitions a match from forming → dissolved, re-queues all players
 // except the one who explicitly declined, and publishes match.dissolved.
-// It is idempotent: concurrent calls for the same match are safe.
+// It is idempotent: the Lua script's status check prevents double-execution.
 func Dissolve(ctx context.Context, rdb *redis.Client, pub *publish.Publisher, st *store.Store, matchID, declinedPlayerID string) {
-	ok, err := transitionStatusScript.Run(ctx, rdb,
-		[]string{rediskeys.MatchStatusKey(matchID)},
-		string(model.MatchStatusForming),
-		string(model.MatchStatusDissolved),
-		int(MatchTTL.Seconds()),
-	).Int()
-	if err != nil || ok == 0 {
-		return // already dissolved or confirmed by another caller
-	}
-
-	match := readAndUpdateStatus(ctx, rdb, matchID, model.MatchStatusDissolved)
+	match := readMatch(ctx, rdb, matchID)
 	if match == nil {
 		return
 	}
 
-	rdb.ZRem(ctx, rediskeys.FormingMatches(), matchID)
-
-	matchQ := queue.New(rdb)
-	requeueShard := model.Shard{Region: match.Shard.Region, Mode: match.Shard.Mode}
+	args := make([]interface{}, 0, 3+len(match.Entries)*3)
+	args = append(args, int(MatchTTL.Seconds()), matchID, declinedPlayerID)
 	for i := range match.Entries {
 		e := &match.Entries[i]
-		if e.PlayerID == declinedPlayerID {
-			continue
+		data, err := json.Marshal(e)
+		if err != nil {
+			slog.Error("failed to marshal entry for dissolve", "player_id", e.PlayerID, "err", err)
+			return
 		}
-		if err := matchQ.Join(ctx, requeueShard, e); err != nil {
-			slog.Error("failed to re-queue player on dissolve", "player_id", e.PlayerID, "err", err)
-		}
+		args = append(args, e.PlayerID, fmt.Sprintf("%d", e.EnqueuedAt.UnixMilli()), string(data))
+	}
+
+	ok, err := dissolveScript.Run(ctx, rdb,
+		[]string{
+			rediskeys.MatchStatusKey(matchID),
+			rediskeys.Match(matchID),
+			rediskeys.FormingMatches(),
+			rediskeys.Queue(match.Shard),
+			rediskeys.Cancelled(match.Shard),
+		},
+		args...,
+	).Int()
+	if err != nil || ok == 0 {
+		return
 	}
 
 	pub.Publish(ctx, publish.ChannelMatchDissolved, publish.MatchDissolvedEvent{
@@ -80,21 +136,23 @@ func Dissolve(ctx context.Context, rdb *redis.Client, pub *publish.Publisher, st
 }
 
 // Confirm transitions a match from forming → confirmed and publishes
-// match.confirmed. Game server allocation is triggered by the caller.
-// It is idempotent: concurrent calls for the same match are safe.
+// match.confirmed. Game server allocation is triggered after confirmation.
+// It is idempotent: the Lua script's status check prevents double-execution.
 func Confirm(ctx context.Context, rdb *redis.Client, pub *publish.Publisher, st *store.Store, matchID string) {
-	ok, err := transitionStatusScript.Run(ctx, rdb,
-		[]string{rediskeys.MatchStatusKey(matchID)},
-		string(model.MatchStatusForming),
-		string(model.MatchStatusConfirmed),
-		int(MatchTTL.Seconds()),
+	// Read before the script so we have player IDs for the publish event.
+	match := readMatch(ctx, rdb, matchID)
+
+	ok, err := confirmScript.Run(ctx, rdb,
+		[]string{
+			rediskeys.MatchStatusKey(matchID),
+			rediskeys.Match(matchID),
+			rediskeys.FormingMatches(),
+		},
+		int(MatchTTL.Seconds()), matchID,
 	).Int()
 	if err != nil || ok == 0 {
 		return
 	}
-
-	match := readAndUpdateStatus(ctx, rdb, matchID, model.MatchStatusConfirmed)
-	rdb.ZRem(ctx, rediskeys.FormingMatches(), matchID)
 
 	var playerIDs []string
 	if match != nil {
@@ -129,9 +187,7 @@ func allocateServer(pub *publish.Publisher, matchID string, playerIDs []string) 
 	})
 }
 
-// readAndUpdateStatus reads the match record, sets its Status field to the
-// given value, and writes it back. It returns nil if the match is not found.
-func readAndUpdateStatus(ctx context.Context, rdb *redis.Client, matchID string, status model.MatchStatus) *model.Match {
+func readMatch(ctx context.Context, rdb *redis.Client, matchID string) *model.Match {
 	data, err := rdb.Get(ctx, rediskeys.Match(matchID)).Bytes()
 	if err != nil {
 		return nil
@@ -140,11 +196,5 @@ func readAndUpdateStatus(ctx context.Context, rdb *redis.Client, matchID string,
 	if err := json.Unmarshal(data, &match); err != nil {
 		return nil
 	}
-	match.Status = status
-	updated, err := json.Marshal(&match)
-	if err != nil {
-		return nil
-	}
-	rdb.Set(ctx, rediskeys.Match(matchID), updated, MatchTTL)
 	return &match
 }
