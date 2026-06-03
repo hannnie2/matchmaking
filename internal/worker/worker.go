@@ -10,6 +10,7 @@ import (
 	"matchmaking/internal/rediskeys"
 	"matchmaking/internal/store"
 	"os"
+	"strconv"
 	"sync/atomic"
 	"time"
 
@@ -44,28 +45,66 @@ else
 end
 `)
 
-// commitMatchScript atomically checks the cancelled set, writes the match
-// record, sets the status key, and adds the match to the forming set.
+// popToProcessingScript atomically pops up to ARGV[1] entries from the queue
+// sorted set (KEYS[1]) and writes them into the processing sorted set (KEYS[2])
+// with their original scores, so a crashed worker's in-flight entries can be
+// recovered by the standby without data loss.
+var popToProcessingScript = redis.NewScript(`
+local res = redis.call("ZPOPMIN", KEYS[1], ARGV[1])
+for i = 1, #res, 2 do
+    redis.call("ZADD", KEYS[2], tonumber(res[i+1]), res[i])
+end
+return res
+`)
+
+// drainProcessingScript moves all entries from the processing sorted set
+// (KEYS[1]) back into the queue sorted set (KEYS[2]), preserving original
+// scores, then deletes the processing set. Called on worker startup to recover
+// any entries left in-flight by a previously crashed worker.
+var drainProcessingScript = redis.NewScript(`
+local entries = redis.call("ZRANGE", KEYS[1], 0, -1, "WITHSCORES")
+if #entries == 0 then return 0 end
+local args = {}
+for i = 1, #entries, 2 do
+    table.insert(args, tonumber(entries[i+1]))
+    table.insert(args, entries[i])
+end
+redis.call("ZADD", KEYS[2], unpack(args))
+redis.call("DEL", KEYS[1])
+return #entries / 2
+`)
+
+// commitMatchScript atomically checks the cancelled set, removes the matched
+// players from the processing set, writes the match record, sets the status
+// key, and adds the match to the forming set.
 //
-// KEYS[1]    = cancelled:{region}:{mode}
-// KEYS[2]    = match:{matchID}
-// KEYS[3]    = matches:forming
-// KEYS[4]    = match:{matchID}:status
-// ARGV[1..N] = playerIDs
-// ARGV[N+1]  = match JSON
-// ARGV[N+2]  = TTL seconds
-// ARGV[N+3]  = formation score (UnixMilli)
-// ARGV[N+4]  = matchID
+// KEYS[1]          = cancelled:{region}:{mode}
+// KEYS[2]          = match:{matchID}
+// KEYS[3]          = matches:forming
+// KEYS[4]          = match:{matchID}:status
+// KEYS[5]          = processing:{shard}
+// ARGV[1]          = N (number of players)
+// ARGV[2..N+1]     = playerIDs (for cancelled check)
+// ARGV[N+2..2N+1]  = raw queue members/JSON (for ZREM from processing)
+// ARGV[2N+2]       = match JSON
+// ARGV[2N+3]       = TTL seconds
+// ARGV[2N+4]       = formation score (UnixMilli)
+// ARGV[2N+5]       = matchID
 var commitMatchScript = redis.NewScript(`
-local n = #ARGV - 4
-for i = 1, n do
+local n = tonumber(ARGV[1])
+for i = 2, n+1 do
     if redis.call("SISMEMBER", KEYS[1], ARGV[i]) == 1 then
         return 0
     end
 end
-redis.call("SET", KEYS[2], ARGV[n+1], "EX", tonumber(ARGV[n+2]))
-redis.call("SET", KEYS[4], "forming", "EX", tonumber(ARGV[n+2]))
-redis.call("ZADD", KEYS[3], tonumber(ARGV[n+3]), ARGV[n+4])
+redis.call("SET", KEYS[2], ARGV[2*n+2], "EX", tonumber(ARGV[2*n+3]))
+redis.call("SET", KEYS[4], "forming", "EX", tonumber(ARGV[2*n+3]))
+redis.call("ZADD", KEYS[3], tonumber(ARGV[2*n+4]), ARGV[2*n+5])
+local members = {}
+for i = 1, n do
+    members[i] = ARGV[n+1+i]
+end
+redis.call("ZREM", KEYS[5], unpack(members))
 return 1
 `)
 
@@ -100,6 +139,10 @@ func (m *MatchMaker) Run(ctx context.Context) error {
 		return fmt.Errorf("acquire shard lock: %w", err)
 	}
 	defer m.releaseShardLock()
+
+	if err := m.drainProcessing(ctx); err != nil {
+		return fmt.Errorf("drain processing set: %w", err)
+	}
 
 	g, ctx := errgroup.WithContext(ctx)
 	g.Go(func() error { return m.renewLockLoop(ctx) })
@@ -159,6 +202,19 @@ func (m *MatchMaker) releaseShardLock() {
 	slog.Info("released shard lock", "shard", m.shard)
 }
 
+func (m *MatchMaker) drainProcessing(ctx context.Context) error {
+	n, err := drainProcessingScript.Run(ctx, m.rdb,
+		[]string{rediskeys.Processing(m.shard), rediskeys.Queue(m.shard)},
+	).Int()
+	if err != nil {
+		return fmt.Errorf("drain processing: %w", err)
+	}
+	if n > 0 {
+		slog.Info("recovered in-flight entries from processing set", "shard", m.shard, "count", n)
+	}
+	return nil
+}
+
 // bufferedEntry holds a popped player, the raw JSON member (for re-push), and
 // the original score (to preserve FIFO ordering on conflict).
 type bufferedEntry struct {
@@ -183,13 +239,36 @@ func (m *MatchMaker) popLoop(ctx context.Context) error {
 	}
 }
 
-// popOnce pops up to popBatchSize players from the sorted set, parses their
-// JSON members directly, filters cancelled players via SMIsMember, and commits
-// a match whenever the buffer reaches matchSize. Returns the updated buffer.
-func (m *MatchMaker) popOnce(ctx context.Context, buffer []bufferedEntry) ([]bufferedEntry, error) {
-	zs, err := m.rdb.ZPopMin(ctx, rediskeys.Queue(m.shard), popBatchSize).Result()
+// popBatch atomically moves up to popBatchSize entries from the queue sorted
+// set into the processing sorted set and returns them as redis.Z values.
+func (m *MatchMaker) popBatch(ctx context.Context) ([]redis.Z, error) {
+	vals, err := popToProcessingScript.Run(ctx, m.rdb,
+		[]string{rediskeys.Queue(m.shard), rediskeys.Processing(m.shard)},
+		popBatchSize,
+	).Slice()
+	if err == redis.Nil || len(vals) == 0 {
+		return nil, nil
+	}
 	if err != nil {
-		return buffer, fmt.Errorf("zpopmin: %w", err)
+		return nil, fmt.Errorf("pop to processing: %w", err)
+	}
+	zs := make([]redis.Z, 0, len(vals)/2)
+	for i := 0; i+1 < len(vals); i += 2 {
+		member, _ := vals[i].(string)
+		score, _ := strconv.ParseFloat(fmt.Sprintf("%s", vals[i+1]), 64)
+		zs = append(zs, redis.Z{Member: member, Score: score})
+	}
+	return zs, nil
+}
+
+// popOnce pops up to popBatchSize players from the queue into the processing
+// set, parses their JSON members directly, filters cancelled players via
+// SMIsMember, and commits a match whenever the buffer reaches matchSize.
+// Returns the updated buffer.
+func (m *MatchMaker) popOnce(ctx context.Context, buffer []bufferedEntry) ([]bufferedEntry, error) {
+	zs, err := m.popBatch(ctx)
+	if err != nil {
+		return buffer, err
 	}
 
 	if len(zs) == 0 {
@@ -343,10 +422,15 @@ func (m *MatchMaker) commitMatch(ctx context.Context, group []bufferedEntry) (bo
 		rediskeys.Match(match.ID),
 		rediskeys.FormingMatches(m.shard),
 		rediskeys.MatchStatusKey(match.ID),
+		rediskeys.Processing(m.shard),
 	}
-	args := make([]interface{}, 0, len(playerIDs)+4)
+	args := make([]interface{}, 0, 1+2*len(playerIDs)+4)
+	args = append(args, len(playerIDs))
 	for _, id := range playerIDs {
 		args = append(args, id)
+	}
+	for _, be := range group {
+		args = append(args, be.member)
 	}
 	args = append(args,
 		string(matchData),
@@ -382,13 +466,16 @@ func (m *MatchMaker) commitMatch(ctx context.Context, group []bufferedEntry) (bo
 }
 
 func (m *MatchMaker) repushGroup(ctx context.Context, group []bufferedEntry) error {
+	members := make([]interface{}, len(group))
 	pipe := m.rdb.Pipeline()
-	for _, be := range group {
+	for i, be := range group {
 		pipe.ZAdd(ctx, rediskeys.Queue(m.shard), redis.Z{
 			Score:  be.score,
-			Member: be.member, // re-push the original JSON member
+			Member: be.member,
 		})
+		members[i] = be.member
 	}
+	pipe.ZRem(ctx, rediskeys.Processing(m.shard), members...)
 	_, err := pipe.Exec(ctx)
 	return err
 }

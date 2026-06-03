@@ -40,6 +40,14 @@ func FormingMatches(shard model.Shard) string {
 	return fmt.Sprintf("%s:forming:%s", hashTag(shard), shard.RatingBand)
 }
 
+// Processing is the sorted set holding entries that have been popped from the
+// queue but not yet committed to a match. Score preserves the original enqueue
+// timestamp so entries can be re-queued with FIFO ordering on recovery.
+// Shares the region/mode hash tag so it is co-slotted with Queue and Cancelled.
+func Processing(shard model.Shard) string {
+	return fmt.Sprintf("%s:processing:%s", hashTag(shard), shard.RatingBand)
+}
+
 // PendingMatchEvent holds the match.found payload for a player who has not yet
 // acknowledged receipt. Not accessed by any Lua script; slot placement is irrelevant.
 func PendingMatchEvent(playerID string) string { return "pending:match:" + playerID }
