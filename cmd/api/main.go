@@ -17,17 +17,20 @@ import (
 )
 
 func main() {
-	rdb := redis.NewClient(&redis.Options{
-		Addr: envOr("REDIS_ADDR", "localhost:6379"),
-	})
+	cfg, err := api.LoadConfig()
+	if err != nil {
+		slog.Error("invalid configuration", "err", err)
+		os.Exit(1)
+	}
 
+	rdb := redis.NewClient(&redis.Options{Addr: cfg.RedisAddr})
 	q := queue.New(rdb)
 	pub := publish.New(rdb)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 
-	st, err := store.New(ctx, envOr("POSTGRES_DSN", "postgres://matchmaking:matchmaking@localhost:5432/matchmaking"))
+	st, err := store.New(ctx, cfg.DBConnStr)
 	if err != nil {
 		slog.Error("failed to connect to postgres", "err", err)
 		os.Exit(1)
@@ -36,7 +39,7 @@ func main() {
 
 	mux := http.NewServeMux()
 	api.NewHandler(q, rdb, pub, st).RegisterRoutes(mux)
-	server := &http.Server{Addr: ":8080", Handler: mux}
+	server := &http.Server{Addr: cfg.HTTPAddr, Handler: mux}
 
 	go func() {
 		<-ctx.Done()
@@ -50,9 +53,3 @@ func main() {
 	}
 }
 
-func envOr(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return fallback
-}

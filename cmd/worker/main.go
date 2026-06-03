@@ -15,16 +15,19 @@ import (
 )
 
 func main() {
-	rdb := redis.NewClient(&redis.Options{
-		Addr: envOr("REDIS_ADDR", "localhost:6379"),
-	})
+	cfg, err := worker.LoadConfig()
+	if err != nil {
+		slog.Error("invalid configuration", "err", err)
+		os.Exit(1)
+	}
 
+	rdb := redis.NewClient(&redis.Options{Addr: cfg.RedisAddr})
 	pub := publish.New(rdb)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 
-	st, err := store.New(ctx, envOr("POSTGRES_DSN", "postgres://matchmaking:matchmaking@localhost:5432/matchmaking"))
+	st, err := store.New(ctx, cfg.DBConnStr)
 	if err != nil {
 		slog.Error("failed to connect to postgres", "err", err)
 		os.Exit(1)
@@ -33,9 +36,9 @@ func main() {
 
 	mm := worker.New(
 		model.Shard{
-			Region:    envOr("SHARD_REGION", "NA-E"),
-			Mode:      envOr("SHARD_MODE", "ranked"),
-			RatingBand: envOr("SHARD_RATINGBAND", "1000-1200"),
+			Region:     cfg.ShardRegion,
+			Mode:       cfg.ShardMode,
+			RatingBand: cfg.ShardRatingBand,
 		},
 		rdb,
 		pub,
@@ -47,11 +50,4 @@ func main() {
 		slog.Error("worker exited", "err", err)
 		os.Exit(1)
 	}
-}
-
-func envOr(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return fallback
 }
