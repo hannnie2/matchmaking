@@ -3,14 +3,15 @@ package worker
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"matchmaking/internal/model"
 	"matchmaking/internal/publish"
 	"matchmaking/internal/rediskeys"
-	"matchmaking/internal/store"
 	"os"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -19,14 +20,16 @@ import (
 )
 
 const (
-	lockTTL              = 5 * time.Second
-	lockRenewInterval    = 2 * time.Second
-	matchTTL             = 10 * time.Minute
-	popBatchSize         = 24
-	emptyQueueDelay      = 100 * time.Millisecond
-	ratingDiffAllowance  = 50
-	maxRatingDiff        = 300
+	lockTTL               = 5 * time.Second
+	lockRenewInterval     = 2 * time.Second
+	matchTTL              = 10 * time.Minute
+	popBatchSize          = 24
+	emptyQueueDelay       = 100 * time.Millisecond
+	ratingDiffAllowance   = 50
+	maxRatingDiff         = 300
 	ratingExpandPerSecond = 5 // rating window widens by 5 per second of wait
+	streamGroup           = "pg-writer"
+	streamMaxLen          = 1000
 )
 
 var lockRenewScript = redis.NewScript(`
@@ -83,6 +86,7 @@ return #entries / 2
 // KEYS[3]          = matches:forming
 // KEYS[4]          = match:{matchID}:status
 // KEYS[5]          = processing:{shard}
+// KEYS[6]          = match-stream:{shard}
 // ARGV[1]          = N (number of players)
 // ARGV[2..N+1]     = playerIDs (for cancelled check)
 // ARGV[N+2..2N+1]  = raw queue members/JSON (for ZREM from processing)
@@ -90,6 +94,7 @@ return #entries / 2
 // ARGV[2N+3]       = TTL seconds
 // ARGV[2N+4]       = formation score (UnixMilli)
 // ARGV[2N+5]       = matchID
+// ARGV[2N+6]       = stream max length
 var commitMatchScript = redis.NewScript(`
 local n = tonumber(ARGV[1])
 for i = 2, n+1 do
@@ -105,20 +110,27 @@ for i = 1, n do
     members[i] = ARGV[n+1+i]
 end
 redis.call("ZREM", KEYS[5], unpack(members))
+redis.call("XADD", KEYS[6], "MAXLEN", "~", ARGV[2*n+6], "*", "match_id", ARGV[2*n+5], "data", ARGV[2*n+2])
 return 1
 `)
+
+// matchStore is the subset of store.Store used by MatchMaker, defined as an
+// interface so tests can substitute a fake without a real database.
+type matchStore interface {
+	InsertMatch(ctx context.Context, m *model.Match) error
+}
 
 type MatchMaker struct {
 	matchSize int
 	shard     model.Shard
 	rdb       *redis.Client
 	pub       *publish.Publisher // nil = no-op
-	st        *store.Store       // nil = no-op
+	st        matchStore         // nil = no-op
 	workerID  string
 	matchSeq  atomic.Int64
 }
 
-func New(shard model.Shard, rdb *redis.Client, pub *publish.Publisher, matchSize int, st *store.Store) *MatchMaker {
+func New(shard model.Shard, rdb *redis.Client, pub *publish.Publisher, matchSize int, st matchStore) *MatchMaker {
 	return &MatchMaker{
 		matchSize: matchSize,
 		shard:     shard,
@@ -140,6 +152,15 @@ func (m *MatchMaker) Run(ctx context.Context) error {
 	}
 	defer m.releaseShardLock()
 
+	if m.st != nil {
+		if err := m.ensureStreamGroup(ctx); err != nil {
+			return fmt.Errorf("ensure stream group: %w", err)
+		}
+		if err := m.claimStaleStreamEntries(ctx); err != nil {
+			return fmt.Errorf("claim stale stream entries: %w", err)
+		}
+	}
+
 	if err := m.drainProcessing(ctx); err != nil {
 		return fmt.Errorf("drain processing set: %w", err)
 	}
@@ -147,6 +168,9 @@ func (m *MatchMaker) Run(ctx context.Context) error {
 	g, ctx := errgroup.WithContext(ctx)
 	g.Go(func() error { return m.renewLockLoop(ctx) })
 	g.Go(func() error { return m.popLoop(ctx) })
+	if m.st != nil {
+		g.Go(func() error { return m.streamConsumerLoop(ctx) })
+	}
 	return g.Wait()
 }
 
@@ -213,6 +237,90 @@ func (m *MatchMaker) drainProcessing(ctx context.Context) error {
 		slog.Info("recovered in-flight entries from processing set", "shard", m.shard, "count", n)
 	}
 	return nil
+}
+
+func (m *MatchMaker) ensureStreamGroup(ctx context.Context) error {
+	err := m.rdb.XGroupCreateMkStream(ctx, rediskeys.MatchStream(m.shard), streamGroup, "0").Err()
+	if err != nil && !strings.HasPrefix(err.Error(), "BUSYGROUP") {
+		return fmt.Errorf("xgroup create: %w", err)
+	}
+	return nil
+}
+
+// claimStaleStreamEntries reclaims any entries left unACKed by the previous
+// worker and writes them to PostgreSQL. Must run before drainProcessing so
+// that players already committed to a match are not re-queued.
+func (m *MatchMaker) claimStaleStreamEntries(ctx context.Context) error {
+	streamKey := rediskeys.MatchStream(m.shard)
+	start := "0-0"
+	for {
+		msgs, next, err := m.rdb.XAutoClaim(ctx, &redis.XAutoClaimArgs{
+			Stream:   streamKey,
+			Group:    streamGroup,
+			Consumer: m.workerID,
+			MinIdle:  0,
+			Start:    start,
+			Count:    100,
+		}).Result()
+		if err != nil {
+			return fmt.Errorf("xautoclaim: %w", err)
+		}
+		for _, msg := range msgs {
+			if err := m.processStreamEntry(ctx, msg); err != nil {
+				slog.Error("failed to process stale stream entry", "id", msg.ID, "err", err)
+			}
+		}
+		if next == "0-0" {
+			break
+		}
+		start = next
+	}
+	return nil
+}
+
+func (m *MatchMaker) streamConsumerLoop(ctx context.Context) error {
+	streamKey := rediskeys.MatchStream(m.shard)
+	for {
+		streams, err := m.rdb.XReadGroup(ctx, &redis.XReadGroupArgs{
+			Group:    streamGroup,
+			Consumer: m.workerID,
+			Streams:  []string{streamKey, ">"},
+			Count:    10,
+			Block:    time.Second,
+		}).Result()
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil
+		}
+		if err == redis.Nil {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("xreadgroup: %w", err)
+		}
+		for _, s := range streams {
+			for _, msg := range s.Messages {
+				if err := m.processStreamEntry(ctx, msg); err != nil {
+					// Leave unACKed — claimStaleStreamEntries will retry on next startup.
+					slog.Error("failed to write match to postgres", "id", msg.ID, "err", err)
+				}
+			}
+		}
+	}
+}
+
+func (m *MatchMaker) processStreamEntry(ctx context.Context, msg redis.XMessage) error {
+	data, ok := msg.Values["data"].(string)
+	if !ok {
+		return fmt.Errorf("stream message %s missing data field", msg.ID)
+	}
+	var match model.Match
+	if err := json.Unmarshal([]byte(data), &match); err != nil {
+		return fmt.Errorf("unmarshal match: %w", err)
+	}
+	if err := m.st.InsertMatch(ctx, &match); err != nil {
+		return err
+	}
+	return m.rdb.XAck(ctx, rediskeys.MatchStream(m.shard), streamGroup, msg.ID).Err()
 }
 
 // bufferedEntry holds a popped player, the raw JSON member (for re-push), and
@@ -423,8 +531,9 @@ func (m *MatchMaker) commitMatch(ctx context.Context, group []bufferedEntry) (bo
 		rediskeys.FormingMatches(m.shard),
 		rediskeys.MatchStatusKey(match.ID),
 		rediskeys.Processing(m.shard),
+		rediskeys.MatchStream(m.shard),
 	}
-	args := make([]interface{}, 0, 1+2*len(playerIDs)+4)
+	args := make([]interface{}, 0, 1+2*len(playerIDs)+5)
 	args = append(args, len(playerIDs))
 	for _, id := range playerIDs {
 		args = append(args, id)
@@ -437,6 +546,7 @@ func (m *MatchMaker) commitMatch(ctx context.Context, group []bufferedEntry) (bo
 		int(matchTTL.Seconds()),
 		now.UnixMilli(),
 		match.ID,
+		streamMaxLen,
 	)
 
 	result, err := commitMatchScript.Run(ctx, m.rdb, keys, args...).Int()
@@ -453,14 +563,6 @@ func (m *MatchMaker) commitMatch(ctx context.Context, group []bufferedEntry) (bo
 			MatchID:   match.ID,
 			PlayerIDs: playerIDs,
 		})
-	}
-	if m.st != nil {
-		st, snap := m.st, match
-		go func() {
-			if err := st.InsertMatch(context.Background(), snap); err != nil {
-				slog.Error("failed to persist match", "match_id", snap.ID, "err", err)
-			}
-		}()
 	}
 	return true, nil
 }

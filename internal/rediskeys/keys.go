@@ -40,6 +40,14 @@ func FormingMatches(shard model.Shard) string {
 	return fmt.Sprintf("%s:forming:%s", hashTag(shard), shard.RatingBand)
 }
 
+// MatchStream is the Redis Stream that records every committed match for
+// reliable async delivery to PostgreSQL. Written inside commitMatchScript so
+// the stream entry and the match commit are atomic. Shares the region/mode
+// hash tag so it is co-slotted with all other shard keys.
+func MatchStream(shard model.Shard) string {
+	return fmt.Sprintf("%s:match-stream:%s", hashTag(shard), shard.RatingBand)
+}
+
 // Processing is the sorted set holding entries that have been popped from the
 // queue but not yet committed to a match. Score preserves the original enqueue
 // timestamp so entries can be re-queued with FIFO ordering on recovery.
