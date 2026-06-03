@@ -18,11 +18,14 @@ import (
 )
 
 const (
-	lockTTL           = 5 * time.Second
-	lockRenewInterval = 2 * time.Second
-	matchTTL          = 10 * time.Minute
-	popBatchSize      = 24
-	emptyQueueDelay   = 100 * time.Millisecond
+	lockTTL              = 5 * time.Second
+	lockRenewInterval    = 2 * time.Second
+	matchTTL             = 10 * time.Minute
+	popBatchSize         = 24
+	emptyQueueDelay      = 100 * time.Millisecond
+	ratingDiffAllowance  = 50
+	maxRatingDiff        = 300
+	ratingExpandPerSecond = 5 // rating window widens by 5 per second of wait
 )
 
 var lockRenewScript = redis.NewScript(`
@@ -239,8 +242,11 @@ func (m *MatchMaker) popOnce(ctx context.Context, buffer []bufferedEntry) ([]buf
 	}
 
 	for len(buffer) >= m.matchSize {
-		group := buffer[:m.matchSize]
-		buffer = buffer[m.matchSize:]
+		group, remaining, found := selectGroup(buffer, m.matchSize, time.Now())
+		if !found {
+			break
+		}
+		buffer = remaining
 
 		ok, err := m.commitMatch(ctx, group)
 		if err != nil {
@@ -257,6 +263,52 @@ func (m *MatchMaker) popOnce(ctx context.Context, buffer []bufferedEntry) ([]buf
 	}
 
 	return buffer, nil
+}
+
+// selectGroup picks the oldest-waiting player as anchor, computes a rating
+// window expanded by their wait time, then greedily fills a group of size n
+// from the remaining buffer within that window.
+//
+// Returns the chosen group, the updated buffer with those entries removed, and
+// whether a valid group was found. The buffer order is otherwise preserved.
+func selectGroup(buffer []bufferedEntry, n int, now time.Time) (group []bufferedEntry, remaining []bufferedEntry, found bool) {
+	if len(buffer) < n {
+		return nil, buffer, false
+	}
+
+	anchor := buffer[0]
+	waitSecs := now.Sub(anchor.entry.EnqueuedAt).Seconds()
+	window := ratingDiffAllowance + ratingExpandPerSecond*waitSecs
+	if window > maxRatingDiff {
+		window = maxRatingDiff
+	}
+
+	group = append(group, anchor)
+	chosen := make([]bool, len(buffer))
+	chosen[0] = true
+
+	for i := 1; i < len(buffer) && len(group) < n; i++ {
+		diff := buffer[i].entry.Rating - anchor.entry.Rating
+		if diff < 0 {
+			diff = -diff
+		}
+		if diff <= window {
+			group = append(group, buffer[i])
+			chosen[i] = true
+		}
+	}
+
+	if len(group) < n {
+		return nil, buffer, false
+	}
+
+	remaining = make([]bufferedEntry, 0, len(buffer)-n)
+	for i, be := range buffer {
+		if !chosen[i] {
+			remaining = append(remaining, be)
+		}
+	}
+	return group, remaining, true
 }
 
 // commitMatch atomically verifies no player has been cancelled, writes the
