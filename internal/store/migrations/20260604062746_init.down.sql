@@ -1,0 +1,7 @@
+DROP TABLE IF EXISTS match_players;
+DROP TABLE IF EXISTS player_ratings;
+DROP TABLE IF EXISTS matches;
+DROP TABLE IF EXISTS players;
+
+DROP TYPE IF EXISTS match_status;
+DROP TYPE IF EXISTS match_mode;
