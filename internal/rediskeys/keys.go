@@ -56,6 +56,13 @@ func Processing(shard model.Shard) string {
 	return fmt.Sprintf("%s:processing:%s", hashTag(shard), shard.RatingBand)
 }
 
+// InQueue is the set of player IDs that currently have a live entry in the
+// queue or are in the forming/confirming phase. Prevents double-join. Shares
+// the region/mode hash tag so it is co-slotted with Queue and Cancelled.
+func InQueue(shard model.Shard) string {
+	return fmt.Sprintf("%s:inqueue", hashTag(shard))
+}
+
 // PendingMatchEvent holds the match.found payload for a player who has not yet
 // acknowledged receipt. Not accessed by any Lua script; slot placement is irrelevant.
 func PendingMatchEvent(playerID string) string { return "pending:match:" + playerID }

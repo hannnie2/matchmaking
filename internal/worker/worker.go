@@ -420,12 +420,19 @@ func (m *MatchMaker) popOnce(ctx context.Context, buffer []bufferedEntry) ([]buf
 		cancelled = make([]bool, len(candidates))
 	}
 
+	var toUncancel []interface{}
 	for i, c := range candidates {
 		if cancelled[i] {
 			slog.Debug("skipping cancelled player", "player_id", c.entry.PlayerID)
+			toUncancel = append(toUncancel, c.entry.PlayerID)
 			continue
 		}
 		buffer = append(buffer, bufferedEntry{entry: c.entry, member: c.member, score: c.score})
+	}
+	if len(toUncancel) > 0 {
+		if err := m.rdb.SRem(ctx, rediskeys.Cancelled(m.shard), toUncancel...).Err(); err != nil {
+			slog.Error("failed to clear discarded players from cancelled set", "err", err)
+		}
 	}
 
 	for len(buffer) >= m.matchSize {

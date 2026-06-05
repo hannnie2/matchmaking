@@ -17,14 +17,16 @@ import (
 const MatchTTL = 10 * time.Minute
 
 // dissolveScript atomically transitions a match from forming → dissolved,
-// removes it from the forming set, updates the match JSON, and re-queues all
-// entries except the declined player (skipping any that are in the cancelled set).
+// removes it from the forming set, updates the match JSON, re-queues all
+// entries except the declined player (skipping any that are in the cancelled
+// set), and removes the declined player from the inqueue set.
 //
 // KEYS[1] = match:{id}:status
 // KEYS[2] = match:{id}
 // KEYS[3] = matches:forming
 // KEYS[4] = q:{region}:{mode}:{ratingBand}
 // KEYS[5] = cancelled:{region}:{mode}
+// KEYS[6] = inqueue:{region}:{mode}
 // ARGV[1] = TTL seconds
 // ARGV[2] = matchID
 // ARGV[3] = declined player ID (empty string if none)
@@ -57,17 +59,24 @@ while i <= #ARGV do
     i = i + 3
 end
 
+if declined ~= "" then
+    redis.call("SREM", KEYS[6], declined)
+end
+
 return 1
 `)
 
 // confirmScript atomically transitions a match from forming → confirmed,
-// removes it from the forming set, and updates the match JSON.
+// removes it from the forming set, updates the match JSON, and removes all
+// players from the inqueue set.
 //
 // KEYS[1] = match:{id}:status
 // KEYS[2] = match:{id}
 // KEYS[3] = matches:forming
+// KEYS[4] = inqueue:{region}:{mode}
 // ARGV[1] = TTL seconds
 // ARGV[2] = matchID
+// ARGV[3..N+2] = playerIDs
 var confirmScript = redis.NewScript(`
 local status = redis.call("GET", KEYS[1])
 if not status or status ~= "forming" then return 0 end
@@ -80,6 +89,12 @@ if raw then
     local m = cjson.decode(raw)
     m["status"] = "confirmed"
     redis.call("SET", KEYS[2], cjson.encode(m), "EX", tonumber(ARGV[1]))
+end
+
+if #ARGV > 2 then
+    local ids = {}
+    for i = 3, #ARGV do ids[i-2] = ARGV[i] end
+    redis.call("SREM", KEYS[4], unpack(ids))
 end
 
 return 1
@@ -113,6 +128,7 @@ func Dissolve(ctx context.Context, rdb *redis.Client, pub *publish.Publisher, st
 			rediskeys.FormingMatches(match.Shard),
 			rediskeys.Queue(match.Shard),
 			rediskeys.Cancelled(match.Shard),
+			rediskeys.InQueue(match.Shard),
 		},
 		args...,
 	).Int()
@@ -146,13 +162,20 @@ func Confirm(ctx context.Context, rdb *redis.Client, pub *publish.Publisher, st 
 		return
 	}
 
+	args := make([]interface{}, 0, 2+len(match.PlayerIDs))
+	args = append(args, int(MatchTTL.Seconds()), matchID)
+	for _, pid := range match.PlayerIDs {
+		args = append(args, pid)
+	}
+
 	ok, err := confirmScript.Run(ctx, rdb,
 		[]string{
 			rediskeys.MatchStatusKey(matchID),
 			rediskeys.Match(matchID),
 			rediskeys.FormingMatches(match.Shard),
+			rediskeys.InQueue(match.Shard),
 		},
-		int(MatchTTL.Seconds()), matchID,
+		args...,
 	).Int()
 	if err != nil || ok == 0 {
 		return

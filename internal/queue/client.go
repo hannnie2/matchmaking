@@ -24,31 +24,33 @@ const (
 // cancellation in Redis. The join is rejected to prevent a ghost match.
 var ErrPlayerCancelled = errors.New("player has a pending cancellation")
 
-// joinScript atomically checks the cancelled set then ZADDs the serialised
-// QueueEntry JSON as the sorted set member. No separate queue_entry key.
+// joinScript atomically checks for double-join and pending cancellation, then
+// ZADDs the serialised QueueEntry JSON and marks the player in the inqueue set.
 //
 // KEYS[1] = q:{region}:{mode}:{skillband}
 // KEYS[2] = cancelled:{region}:{mode}
+// KEYS[3] = inqueue:{region}:{mode}
 // ARGV[1] = enqueue score (UnixMilli as string)
-// ARGV[2] = playerID (for cancelled check only)
+// ARGV[2] = playerID
 // ARGV[3] = serialised QueueEntry JSON (used as member)
 var joinScript = redis.NewScript(`
-if redis.call("SISMEMBER", KEYS[2], ARGV[2]) == 1 then
-    return 0
-end
+if redis.call("SISMEMBER", KEYS[3], ARGV[2]) == 1 then return 0 end
+if redis.call("SISMEMBER", KEYS[2], ARGV[2]) == 1 then return 0 end
+redis.call("SADD", KEYS[3], ARGV[2])
 redis.call("ZADD", KEYS[1], ARGV[1], ARGV[3])
 return 1
 `)
 
-// cancelScript atomically records the cancellation and refreshes the TTL.
-// There is no queue_entry key to delete; the worker filters cancelled players
-// via SMIsMember after each ZPOPMIN.
+// cancelScript atomically records the cancellation and removes the player from
+// the inqueue set so they may rejoin once the worker discards their old entry.
 //
 // KEYS[1] = cancelled:{region}:{mode}
+// KEYS[2] = inqueue:{region}:{mode}
 // ARGV[1] = playerID
 // ARGV[2] = TTL in seconds
 var cancelScript = redis.NewScript(`
-redis.call("SADD", KEYS[1], ARGV[1])
+redis.call("SADD",  KEYS[1], ARGV[1])
+redis.call("SREM",  KEYS[2], ARGV[1])
 redis.call("EXPIRE", KEYS[1], ARGV[2])
 return 1
 `)
@@ -72,7 +74,7 @@ func (c *Client) Join(ctx context.Context, shard model.Shard, entry *model.Queue
 		RatingBand: computeRatingBand(entry.Rating),
 	}
 	result, err := joinScript.Run(ctx, c.rdb,
-		[]string{rediskeys.Queue(qShard), rediskeys.Cancelled(qShard)},
+		[]string{rediskeys.Queue(qShard), rediskeys.Cancelled(qShard), rediskeys.InQueue(qShard)},
 		fmt.Sprintf("%d", entry.EnqueuedAt.UnixMilli()),
 		entry.PlayerID,
 		string(data),
@@ -88,10 +90,11 @@ func (c *Client) Join(ctx context.Context, shard model.Shard, entry *model.Queue
 
 // Cancel records the cancellation atomically. The player's JSON member remains
 // in the sorted set until the worker pops it; the cancelled set causes the
-// worker to discard them before buffering.
+// worker to discard them before buffering. The player is removed from inqueue
+// so they may rejoin once the worker clears them from the cancelled set.
 func (c *Client) Cancel(ctx context.Context, shard model.Shard, playerID string) error {
 	return cancelScript.Run(ctx, c.rdb,
-		[]string{rediskeys.Cancelled(shard)},
+		[]string{rediskeys.Cancelled(shard), rediskeys.InQueue(shard)},
 		playerID, int(cancelledSetTTL.Seconds()),
 	).Err()
 }
