@@ -464,8 +464,8 @@ func selectGroup(buffer []bufferedEntry, n int, now time.Time) (group []buffered
 	}
 
 	anchor := buffer[0]
-	waitSecs := now.Sub(anchor.entry.EnqueuedAt).Seconds()
-	window := ratingDiffAllowance + ratingExpandPerSecond*waitSecs
+	waitSecs := int32(now.Sub(anchor.entry.EnqueuedAt).Seconds())
+	window := int32(ratingDiffAllowance) + int32(ratingExpandPerSecond)*waitSecs
 	if window > maxRatingDiff {
 		window = maxRatingDiff
 	}

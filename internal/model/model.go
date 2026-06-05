@@ -7,10 +7,8 @@ import (
 
 type Player struct {
 	ID          string
-	Rating      float64
-	GamesPlayed int
+	Name 		string
 	CreatedAt   time.Time
-	UpdatedAt   time.Time
 }
 
 type Shard struct {
@@ -28,7 +26,7 @@ func (s Shard) String() string {
 
 type QueueEntry struct {
 	PlayerID   string    `json:"player_id"`
-	Rating     float64   `json:"rating"`
+	Rating     int32   `json:"rating"`
 	EnqueuedAt time.Time `json:"enqueued_at"`
 }
 

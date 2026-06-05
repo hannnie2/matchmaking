@@ -14,7 +14,10 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-const pendingEventTTL = 35 * time.Second
+const (
+	pendingEventTTL = 35 * time.Second
+	sendTimeout     = 5 * time.Second
+)
 
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  1024,
@@ -167,25 +170,29 @@ func (h *Hub) processEvent(ctx context.Context, channel string, payload []byte) 
 	}
 }
 
-// fanOutDirect is called only from the hub goroutine.
+// fanOutDirect is called only from the hub goroutine. It spawns one goroutine
+// per recipient so the hub goroutine never blocks. If writePump doesn't drain
+// within sendTimeout, the client is disconnected rather than the event dropped.
 func (h *Hub) fanOutDirect(playerIDs []string, frame []byte) {
 	for _, pid := range playerIDs {
 		c, ok := h.clients[pid]
 		if !ok {
 			continue
 		}
-		select {
-		case c.send <- frame:
-		default:
-			slog.Warn("hub: dropped event for slow client", "player_id", pid)
-		}
+		go func(c *Client) {
+			select {
+			case c.send <- frame:
+			case <-time.After(sendTimeout):
+				slog.Warn("hub: slow client, disconnecting", "player_id", c.playerID)
+				h.unregister <- c
+				c.conn.Close()
+			}
+		}(c)
 	}
 }
 
 // replayPending runs in its own goroutine. It checks Redis for a pending
 // match.found event and delivers it if the match is still forming.
-// safeSend guards against the race where the client disconnects while this
-// goroutine is mid-flight and the hub closes c.send.
 func (h *Hub) replayPending(ctx context.Context, c *Client) {
 	data, err := h.rdb.Get(ctx, rediskeys.PendingMatchEvent(c.playerID)).Bytes()
 	if err != nil {
@@ -200,15 +207,9 @@ func (h *Hub) replayPending(ctx context.Context, c *Client) {
 		h.rdb.Del(ctx, rediskeys.PendingMatchEvent(c.playerID))
 		return
 	}
-	safeSend(c.send, data)
-}
-
-// safeSend sends to ch without blocking and recovers if ch is already closed.
-func safeSend(ch chan []byte, v []byte) {
-	defer func() { recover() }()
 	select {
-	case ch <- v:
-	default:
+	case c.send <- data:
+	case <-ctx.Done():
 	}
 }
 
@@ -232,7 +233,7 @@ func (h *Hub) ServeWS(w http.ResponseWriter, r *http.Request) {
 		hub:      h,
 		playerID: playerID,
 		conn:     conn,
-		send:     make(chan []byte, 10),
+		send:     make(chan []byte),
 	}
 	h.register <- c
 	go c.writePump()

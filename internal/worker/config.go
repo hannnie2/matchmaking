@@ -29,6 +29,9 @@ func LoadConfig() (*Config, error) {
 	dbPassword := required("DB_PASSWORD")
 	dbName := required("DB_NAME")
 	dbPort := envOr("DB_PORT", "5432")
+	region := required("SHARD_REGION")
+	mode := required("SHARD_MODE")
+	ratingBand := required("SHARD_RATINGBAND")
 
 	if len(missing) > 0 {
 		return nil, fmt.Errorf("missing required env vars: %s", strings.Join(missing, ", "))
@@ -37,9 +40,9 @@ func LoadConfig() (*Config, error) {
 	return &Config{
 		RedisAddr:       envOr("REDIS_ADDR", "localhost:6379"),
 		DBConnStr:     fmt.Sprintf("postgres://%s:%s@%s:%s/%s", dbUser, dbPassword, dbHost, dbPort, dbName),
-		ShardRegion:     envOr("SHARD_REGION", "NA-E"),
-		ShardMode:       envOr("SHARD_MODE", "ranked"),
-		ShardRatingBand: envOr("SHARD_RATINGBAND", "1000-1200"),
+		ShardRegion:     region,
+		ShardMode:       mode,
+		ShardRatingBand: ratingBand,
 	}, nil
 }
 

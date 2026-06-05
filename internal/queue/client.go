@@ -114,7 +114,7 @@ func (c *Client) GetMatch(ctx context.Context, matchID string) (*model.Match, er
 
 // computeRatingBand returns the rating band key for a given rating value.
 // Bands are [1000,1200), [1200,1400), ..., [2200,2400].
-func computeRatingBand(rating float64) string {
+func computeRatingBand(rating int32) string {
 	r := int(rating)
 	if r < skillBandMin {
 		r = skillBandMin

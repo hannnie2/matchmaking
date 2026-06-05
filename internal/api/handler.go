@@ -9,6 +9,7 @@ import (
 	"matchmaking/internal/rediskeys"
 	"matchmaking/internal/store"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -80,7 +81,18 @@ func (h *Handler) join(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	player, err := h.st.GetPlayer(r.Context(), body.PlayerID)
+	playerId, err := strconv.ParseInt(body.PlayerID, 10, 64)
+
+	if err != nil {
+		return
+	}
+
+	if err := h.st.UpsertPlayerRating(r.Context(), int32(playerId), body.Mode); err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	player, err := h.st.GetPlayer(r.Context(), int32(playerId), body.Mode)
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
@@ -92,7 +104,7 @@ func (h *Handler) join(w http.ResponseWriter, r *http.Request) {
 
 	shard := model.Shard{Region: body.Region, Mode: body.Mode}
 	entry := &model.QueueEntry{
-		PlayerID:   player.ID,
+		PlayerID:   body.PlayerID,
 		Rating:     player.Rating,
 		EnqueuedAt: time.Now(),
 	}
