@@ -30,6 +30,7 @@ func LoadConfig() (*Config, error) {
 	dbPassword := required("DB_PASSWORD")
 	dbName := required("DB_NAME")
 	dbPort := envOr("DB_PORT", "5432")
+	dbPoolMax := envOr("DB_POOL_MAX_CONNS", "50")
 
 	if len(missing) > 0 {
 		return nil, fmt.Errorf("missing required env vars: %s", strings.Join(missing, ", "))
@@ -37,7 +38,7 @@ func LoadConfig() (*Config, error) {
 
 	return &Config{
 		RedisAddr:   envOr("REDIS_ADDR", "localhost:6379"),
-		DBConnStr: fmt.Sprintf("postgres://%s:%s@%s:%s/%s", dbUser, dbPassword, dbHost, dbPort, dbName),
+		DBConnStr: fmt.Sprintf("postgres://%s:%s@%s:%s/%s?pool_max_conns=%s", dbUser, dbPassword, dbHost, dbPort, dbName, dbPoolMax),
 		HTTPAddr:    envOr("HTTP_ADDR", ":8080"),
 	}, nil
 }

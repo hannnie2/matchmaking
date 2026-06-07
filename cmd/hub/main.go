@@ -10,10 +10,15 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/joho/godotenv"
 	"github.com/redis/go-redis/v9"
 )
 
 func main() {
+	if err := godotenv.Load(); err != nil && !errors.Is(err, os.ErrNotExist) {
+		slog.Warn("godotenv", "err", err)
+	}
+
 	cfg, err := hub.LoadConfig()
 	if err != nil {
 		slog.Error("invalid configuration", "err", err)

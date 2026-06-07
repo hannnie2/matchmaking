@@ -78,8 +78,8 @@ return #entries / 2
 `)
 
 // commitMatchScript atomically checks the cancelled set, removes the matched
-// players from the processing set, writes the match record, sets the status
-// key, and adds the match to the forming set.
+// players from the processing set and inqueue set, writes the match record,
+// sets the status key, and adds the match to the forming set.
 //
 // KEYS[1]          = cancelled:{region}:{mode}
 // KEYS[2]          = match:{matchID}
@@ -87,8 +87,9 @@ return #entries / 2
 // KEYS[4]          = match:{matchID}:status
 // KEYS[5]          = processing:{shard}
 // KEYS[6]          = match-stream:{shard}
+// KEYS[7]          = inqueue:{region}:{mode}
 // ARGV[1]          = N (number of players)
-// ARGV[2..N+1]     = playerIDs (for cancelled check)
+// ARGV[2..N+1]     = playerIDs (for cancelled check and inqueue removal)
 // ARGV[N+2..2N+1]  = raw queue members/JSON (for ZREM from processing)
 // ARGV[2N+2]       = match JSON
 // ARGV[2N+3]       = TTL seconds
@@ -106,10 +107,13 @@ redis.call("SET", KEYS[2], ARGV[2*n+2], "EX", tonumber(ARGV[2*n+3]))
 redis.call("SET", KEYS[4], "forming", "EX", tonumber(ARGV[2*n+3]))
 redis.call("ZADD", KEYS[3], tonumber(ARGV[2*n+4]), ARGV[2*n+5])
 local members = {}
+local playerIDs = {}
 for i = 1, n do
     members[i] = ARGV[n+1+i]
+    playerIDs[i] = ARGV[i+1]
 end
 redis.call("ZREM", KEYS[5], unpack(members))
+redis.call("SREM", KEYS[7], unpack(playerIDs))
 redis.call("XADD", KEYS[6], "MAXLEN", "~", ARGV[2*n+6], "*", "match_id", ARGV[2*n+5], "data", ARGV[2*n+2])
 return 1
 `)
@@ -539,6 +543,7 @@ func (m *MatchMaker) commitMatch(ctx context.Context, group []bufferedEntry) (bo
 		rediskeys.MatchStatusKey(match.ID),
 		rediskeys.Processing(m.shard),
 		rediskeys.MatchStream(m.shard),
+		rediskeys.InQueue(m.shard),
 	}
 	args := make([]interface{}, 0, 1+2*len(playerIDs)+5)
 	args = append(args, len(playerIDs))

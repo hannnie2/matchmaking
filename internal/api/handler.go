@@ -1,7 +1,9 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
+	"matchmaking/internal/cache"
 	"matchmaking/internal/matchops"
 	"matchmaking/internal/model"
 	"matchmaking/internal/publish"
@@ -15,7 +17,10 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-const responseTTL = 10 * time.Minute
+const (
+	responseTTL    = 10 * time.Minute
+	ratingCacheTTL = 5 * time.Minute
+)
 
 // acceptScript atomically records a player's acceptance for a match.
 // Returns -1 if the match is not in forming state, -2 if the player already
@@ -52,14 +57,15 @@ return added
 `)
 
 type Handler struct {
-	q   *queue.Client
-	rdb *redis.Client
-	pub *publish.Publisher
-	st  *store.Store
+	q     *queue.Client
+	rdb   *redis.Client
+	pub   *publish.Publisher
+	st    *store.Store
+	cache *cache.Cache
 }
 
 func NewHandler(q *queue.Client, rdb *redis.Client, pub *publish.Publisher, st *store.Store) *Handler {
-	return &Handler{q: q, rdb: rdb, pub: pub, st: st}
+	return &Handler{q: q, rdb: rdb, pub: pub, st: st, cache: cache.New(rdb)}
 }
 
 func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
@@ -82,22 +88,24 @@ func (h *Handler) join(w http.ResponseWriter, r *http.Request) {
 	}
 
 	playerId, err := strconv.ParseInt(body.PlayerID, 10, 64)
-
 	if err != nil {
+		http.Error(w, "invalid player_id", http.StatusBadRequest)
 		return
 	}
 
-	if err := h.st.UpsertPlayerRating(r.Context(), int32(playerId), body.Mode); err != nil {
+	// Cache-aside read: Redis fronts Postgres so the hot path avoids a DB
+	// round-trip once the rating is warm. The rating row is created at player
+	// seed/registration time, so join never writes to Postgres.
+	key := rediskeys.PlayerRating(body.PlayerID, body.Mode)
+	rating, found, err := h.cache.GetInt(r.Context(), key, ratingCacheTTL, func(ctx context.Context) (int, bool, error) {
+		r, found, err := h.st.GetRating(ctx, int32(playerId), body.Mode)
+		return int(r), found, err
+	})
+	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-
-	player, err := h.st.GetPlayer(r.Context(), int32(playerId), body.Mode)
-	if err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
-	}
-	if player == nil {
+	if !found {
 		http.Error(w, "player not found", http.StatusNotFound)
 		return
 	}
@@ -105,7 +113,7 @@ func (h *Handler) join(w http.ResponseWriter, r *http.Request) {
 	shard := model.Shard{Region: body.Region, Mode: body.Mode}
 	entry := &model.QueueEntry{
 		PlayerID:   body.PlayerID,
-		Rating:     player.Rating,
+		Rating:     int32(rating),
 		EnqueuedAt: time.Now(),
 	}
 	if err := h.q.Join(r.Context(), shard, entry); err != nil {

@@ -66,3 +66,10 @@ func InQueue(shard model.Shard) string {
 // PendingMatchEvent holds the match.found payload for a player who has not yet
 // acknowledged receipt. Not accessed by any Lua script; slot placement is irrelevant.
 func PendingMatchEvent(playerID string) string { return "pending:match:" + playerID }
+
+// PlayerRating caches a player's rating for a mode (cache-aside). Plain string
+// key holding the integer rating; not accessed by any Lua script, so slot
+// placement is irrelevant.
+func PlayerRating(playerID, mode string) string {
+	return fmt.Sprintf("rating:%s:%s", playerID, mode)
+}

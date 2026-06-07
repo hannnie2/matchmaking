@@ -180,6 +180,7 @@ func (h *Hub) fanOutDirect(playerIDs []string, frame []byte) {
 			continue
 		}
 		go func(c *Client) {
+			defer func() { recover() }() // c.send may be closed if client disconnected concurrently
 			select {
 			case c.send <- frame:
 			case <-time.After(sendTimeout):
@@ -194,6 +195,7 @@ func (h *Hub) fanOutDirect(playerIDs []string, frame []byte) {
 // replayPending runs in its own goroutine. It checks Redis for a pending
 // match.found event and delivers it if the match is still forming.
 func (h *Hub) replayPending(ctx context.Context, c *Client) {
+	defer func() { recover() }() // c.send may be closed if client disconnected during Redis I/O
 	data, err := h.rdb.Get(ctx, rediskeys.PendingMatchEvent(c.playerID)).Bytes()
 	if err != nil {
 		return

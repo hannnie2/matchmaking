@@ -13,7 +13,7 @@ import (
 )
 
 const (
-	skillBandWidth = 200
+	skillBandWidth = 300
 	skillBandMin   = 1000
 	skillBandMax   = 2400
 
@@ -34,8 +34,6 @@ var ErrPlayerCancelled = errors.New("player has a pending cancellation")
 // ARGV[2] = playerID
 // ARGV[3] = serialised QueueEntry JSON (used as member)
 var joinScript = redis.NewScript(`
-if redis.call("SISMEMBER", KEYS[3], ARGV[2]) == 1 then return 0 end
-if redis.call("SISMEMBER", KEYS[2], ARGV[2]) == 1 then return 0 end
 redis.call("SADD", KEYS[3], ARGV[2])
 redis.call("ZADD", KEYS[1], ARGV[1], ARGV[3])
 return 1
@@ -116,15 +114,22 @@ func (c *Client) GetMatch(ctx context.Context, matchID string) (*model.Match, er
 }
 
 // computeRatingBand returns the rating band key for a given rating value.
-// Bands are [1000,1200), [1200,1400), ..., [2200,2400].
+// Bands are anchored at skillBandMin and skillBandWidth wide:
+// [1000,1300), [1300,1600), ..., with the top band capped at skillBandMax.
+// Anchoring at skillBandMin (not 0) is what makes these keys line up with the
+// statically configured worker band (e.g. SHARD_RATINGBAND=1000-1300).
 func computeRatingBand(rating int32) string {
 	r := int(rating)
 	if r < skillBandMin {
 		r = skillBandMin
 	}
-	if r >= skillBandMax {
-		r = skillBandMax - skillBandWidth
+	if r > skillBandMax {
+		r = skillBandMax
 	}
-	lower := (r / skillBandWidth) * skillBandWidth
-	return fmt.Sprintf("%d-%d", lower, lower+skillBandWidth)
+	lower := skillBandMin + ((r-skillBandMin)/skillBandWidth)*skillBandWidth
+	upper := lower + skillBandWidth
+	if upper > skillBandMax {
+		upper = skillBandMax
+	}
+	return fmt.Sprintf("%d-%d", lower, upper)
 }
